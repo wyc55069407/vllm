@@ -93,6 +93,51 @@ LLM(
 | `VLLM_GDN_PYTORCH_DECODE` | `0` | Use PyTorch reference for GDN decode kernels (conv1d + recurrent update) |
 | `VLLM_GDN_DEBUG` | `0` | Enable per-layer debug logging for GDN state and outputs |
 
+## Hybrid Page Block Size Derivation (block_size=528)
+
+The block_size=528 comes from aligning the GDN recurrent state to fit within the unified paged KV cache. Both full attention layers and GDN linear attention layers share the same physical page — each page holds 528 KV token slots for attention AND one GDN state for linear attention.
+
+### Per-token KV size (full attention layers)
+
+```
+head_dim          = 256    (explicit in config, NOT hidden_size/num_heads)
+num_kv_heads      = 4      (GQA)
+KV_per_token      = 2(K+V) × 4 × 256 × 2(bf16) = 4096 bytes
+```
+
+### GDN state size (linear attention layers)
+
+```
+conv_dim          = linear_key_head_dim(128) × linear_num_key_heads(16) × 2
+                  + linear_value_head_dim(128) × linear_num_value_heads(32)
+                  = 4096 + 4096 = 8192
+
+conv_state_shape  = (conv_kernel_size-1, conv_dim) = (3, 8192)
+conv_state_bytes  = 3 × 8192 × 2(bf16) = 49,152 bytes (48 KB)
+
+ssm_state_shape   = (num_v_heads, head_v_dim, head_k_dim) = (32, 128, 128)
+ssm_state_bytes   = 32 × 128 × 128 × 4(float32) = 2,097,152 bytes (2048 KB)
+                    ^^^^ float32 because model config mamba_ssm_dtype=float32
+                    (recurrent state accumulates products, needs higher precision)
+
+mamba_page_total  = 48 + 2048 = 2096 KB
+```
+
+### Block size calculation
+
+```
+kernel_alignment  = 16     (Triton attention kernel requirement)
+block_size        = 16 × ⌈2096 KB / (16 × 4 KB)⌉
+                  = 16 × ⌈32.75⌉
+                  = 16 × 33
+                  = 528 tokens
+
+attn_page_size    = 528 × 4096 = 2,162,688 bytes (2112 KB)
+mamba_page_padded = 2112 KB (padded from 2096 KB, +0.76%)
+```
+
+The ssm_state in float32 dominates: 2048 KB out of 2096 KB total (97.7%).
+
 ## Files Modified
 
 | File | Change |
