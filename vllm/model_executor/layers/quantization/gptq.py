@@ -349,11 +349,24 @@ class GPTQLinearMethod(LinearMethodBase):
         layer.exllama_state = exllama_state
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from vllm.platforms import current_platform
+
         # for torch.compile
         layer.qzeros = Parameter(layer.qzeros.data, requires_grad=False)
         layer.qweight = Parameter(layer.qweight.data, requires_grad=False)
         layer.g_idx = Parameter(layer.g_idx.data, requires_grad=False)
         layer.scales = Parameter(layer.scales.data, requires_grad=False)
+
+        # On XPU, skip exllama shuffle (CUDA-only) and use PyTorch fallback
+        if current_platform.is_xpu():
+            if self.quant_config.desc_act:
+                layer.g_idx.data = torch.argsort(layer.g_idx).to(torch.int)
+            else:
+                layer.g_idx.data = torch.empty(
+                    (0,), dtype=torch.int, device=layer.g_idx.device
+                )
+            layer.exllama_state = ExllamaState.READY
+            return
 
         # exllama needs to shuffle the weight after the weight is loaded
         # here we do the shuffle on first forward pass
@@ -367,27 +380,97 @@ class GPTQLinearMethod(LinearMethodBase):
             layer.exllama_state = ExllamaState.READY
             ops.gptq_shuffle(layer.qweight, layer.g_idx, self.quant_config.weight_bits)
 
+    @staticmethod
+    def _gptq_dequant_4bit(
+        qweight: torch.Tensor,
+        qzeros: torch.Tensor,
+        scales: torch.Tensor,
+        g_idx: torch.Tensor,
+        use_v2_format: bool,
+    ) -> torch.Tensor:
+        """Dequantize GPTQ 4-bit packed weights to fp16 using pure PyTorch.
+
+        qweight: [K/8, N] int32 — 8 int4 values packed per int32 along K
+        qzeros:  [num_groups, N/8] int32 — packed zero points along N
+        scales:  [num_groups, N] fp16
+        g_idx:   [K] int32 or empty tensor
+        Returns: [N, K] dequantized weight (ready for F.linear)
+        """
+        K_packed, N = qweight.shape
+        K = K_packed * 8
+        num_groups = scales.shape[0]
+        device = qweight.device
+
+        # Unpack qweight: [K/8, N] -> [K, N]
+        shifts = torch.arange(0, 32, 4, dtype=torch.int32, device=device)
+        w_unpacked = (
+            (qweight.unsqueeze(2) >> shifts.view(1, 1, -1)) & 0xF
+        )  # [K/8, N, 8]
+        w_unpacked = w_unpacked.permute(0, 2, 1).reshape(K, N).to(scales.dtype)
+
+        # Unpack qzeros: [num_groups, N/8] -> [num_groups, N]
+        z_unpacked = (
+            (qzeros.unsqueeze(2) >> shifts.view(1, 1, -1)) & 0xF
+        )  # [num_groups, N/8, 8]
+        N_packed = qzeros.shape[1]
+        z_unpacked = z_unpacked.permute(0, 2, 1).reshape(
+            num_groups, N_packed * 8
+        )[:, :N].to(scales.dtype)
+
+        # Map each input channel to its group
+        if g_idx.numel() > 0:
+            group_map = g_idx.long()
+        else:
+            group_size = K // num_groups
+            group_map = torch.arange(K, device=device) // group_size
+
+        # Gather per-channel scales and zeros
+        s = scales[group_map]      # [K, N]
+        z = z_unpacked[group_map]  # [K, N]
+
+        # Dequantize
+        if use_v2_format:
+            w_deq = (w_unpacked - z) * s
+        else:
+            # GPTQ v1: zero point offset by 1
+            w_deq = (w_unpacked - (z + 1)) * s
+
+        return w_deq.t().contiguous()  # [N, K]
+
     def apply(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        from vllm.platforms import current_platform
+
         out_shape = x.shape[:-1] + (layer.qweight.shape[-1],)
         reshaped_x = x.reshape(-1, x.shape[-1])
 
-        # GPTQ v1 and v2 format checkpoints deals with zero points differently,
-        # and require different gemm kernels.
-        output = ops.gptq_gemm(
-            reshaped_x,
-            layer.qweight,
-            layer.qzeros,
-            layer.scales,
-            layer.g_idx,
-            layer.exllama_state == ExllamaState.READY,
-            self.use_v2_format,
-            self.quant_config.weight_bits,
-        )
+        if current_platform.is_xpu() and self.quant_config.weight_bits == 4:
+            # XPU fallback: dequantize + F.linear
+            w_deq = self._gptq_dequant_4bit(
+                layer.qweight,
+                layer.qzeros,
+                layer.scales,
+                layer.g_idx,
+                self.use_v2_format,
+            )
+            output = torch.nn.functional.linear(reshaped_x, w_deq)
+        else:
+            # GPTQ v1 and v2 format checkpoints deals with zero points
+            # differently, and require different gemm kernels.
+            output = ops.gptq_gemm(
+                reshaped_x,
+                layer.qweight,
+                layer.qzeros,
+                layer.scales,
+                layer.g_idx,
+                layer.exllama_state == ExllamaState.READY,
+                self.use_v2_format,
+                self.quant_config.weight_bits,
+            )
         if bias is not None:
             output.add_(bias)
         return output.reshape(out_shape)

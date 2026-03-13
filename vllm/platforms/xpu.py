@@ -163,8 +163,11 @@ class XPUPlatform(Platform):
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
         # in V1(or with chunked prefill) block_size is 64
+        # For hybrid models (e.g. Qwen3.5 with gated delta net),
+        # verify_and_update_config may have already set a larger block_size
+        # to align attention and mamba page sizes. Respect that.
         if cache_config and not cache_config.user_specified_block_size:
-            cache_config.block_size = 64
+            cache_config.block_size = max(cache_config.block_size, 64)
 
         # lazy import to avoid circular import
         from vllm.config import CompilationMode, CUDAGraphMode

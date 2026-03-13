@@ -103,6 +103,156 @@ from .utils import (
 
 logger = init_logger(__name__)
 
+import os
+_GDN_DEBUG = os.environ.get("VLLM_GDN_DEBUG", "0") == "1"
+_GDN_PYTORCH_DECODE = os.environ.get("VLLM_GDN_PYTORCH_DECODE", "0") == "1"
+_gdn_decode_step_count = 0
+
+
+def _causal_conv1d_update_pytorch_ref(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    activation: str | None,
+    conv_state_indices: torch.Tensor,
+) -> torch.Tensor:
+    """
+    PyTorch reference for single-token decode conv1d update.
+    x: (batch, dim) - single token per sequence
+    conv_state: (num_cache_lines, dim, state_len) where state_len = width - 1
+    weight: (dim, width)
+    bias: (dim,) or None
+    conv_state_indices: (batch,) - which cache line for each sequence
+    Returns: (batch, dim)
+    """
+    batch, dim = x.shape
+    x = x.to(conv_state.dtype)
+    width = weight.shape[1]
+    indices = conv_state_indices.long()
+
+    out = torch.empty(batch, dim, dtype=conv_state.dtype, device=x.device)
+    for i in range(batch):
+        idx = indices[i].item()
+        if idx < 0:  # PAD_SLOT_ID
+            out[i] = 0
+            continue
+        state = conv_state[idx]  # (dim, state_len)
+
+        # Build window: [state, x[i]]
+        window = torch.cat([state, x[i].unsqueeze(-1)], dim=-1)  # (dim, width)
+        # Compute convolution
+        result = (window * weight).sum(dim=-1)  # (dim,)
+        if bias is not None:
+            result = result + bias
+        if activation in ("silu", "swish"):
+            result = result * torch.sigmoid(result)
+        out[i] = result
+
+        # Update state: shift left, append new token
+        new_state = torch.cat(
+            [state[:, 1:], x[i].unsqueeze(-1)], dim=-1
+        )  # (dim, state_len)
+        conv_state[idx] = new_state
+
+    return out.to(x.dtype)
+
+
+def _fused_sigmoid_gating_delta_rule_update_pytorch_ref(
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    dt_bias: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    initial_state: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    ssm_state_indices: torch.Tensor,
+    scale: float | None = None,
+    use_qk_l2norm: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    PyTorch reference for fused sigmoid gating delta rule update.
+    q: (1, T, H, K)   - query heads
+    k: (1, T, H, K)   - key heads
+    v: (1, T, HV, V)  - value heads
+    a: (T, HV)         - gate input
+    b: (T, HV)         - beta input
+    A_log: (HV,)       - log decay
+    dt_bias: (HV,)     - bias for softplus
+    initial_state: (num_states, HV, V, K) - recurrent state
+    cu_seqlens: (N+1,) - cumulative sequence lengths
+    ssm_state_indices: (N,) - indices into initial_state
+    Returns: (o, final_state)
+    """
+    _, T, H, K = q.shape
+    HV = v.shape[2]
+    V = v.shape[3]
+    N = cu_seqlens.shape[0] - 1
+    heads_per_group = HV // H
+
+    if scale is None:
+        scale = K ** -0.5
+
+    o = torch.zeros(1, T, HV, V, dtype=v.dtype, device=v.device)
+
+    for n in range(N):
+        bos = cu_seqlens[n].item()
+        eos = cu_seqlens[n + 1].item()
+        if eos <= bos:
+            continue
+
+        state_idx = ssm_state_indices[n].item()
+        if state_idx < 0:
+            continue
+
+        # Load state: (HV, V, K) in float32
+        h = initial_state[state_idx].float().clone()
+
+        for t_idx in range(bos, eos):
+            for hv in range(HV):
+                i_h = hv // heads_per_group  # map to q/k head
+
+                b_q = q[0, t_idx, i_h].float()
+                b_k = k[0, t_idx, i_h].float()
+                b_v = v[0, t_idx, hv].float()
+
+                # Gating computation
+                x_val = a[t_idx, hv].float() + dt_bias[hv].float()
+                softplus_x = torch.where(
+                    x_val <= 20.0,
+                    torch.log1p(torch.exp(x_val)),
+                    x_val,
+                )
+                g = -torch.exp(A_log[hv].float()) * softplus_x
+                beta_val = torch.sigmoid(b[t_idx, hv].float())
+
+                # L2 norm
+                if use_qk_l2norm:
+                    q_norm = torch.sqrt(torch.sum(b_q * b_q) + 1e-6)
+                    k_norm = torch.sqrt(torch.sum(b_k * b_k) + 1e-6)
+                    b_q = b_q / q_norm
+                    b_k = b_k / k_norm
+                b_q = b_q * scale
+
+                # Decay
+                h[hv] = h[hv] * torch.exp(g)
+
+                # Delta update: v_update = v - h @ k
+                recon = torch.mv(h[hv], b_k)  # (V,)
+                b_v_update = (b_v - recon) * beta_val
+                h[hv] = h[hv] + torch.outer(b_v_update, b_k)
+
+                # Output
+                o[0, t_idx, hv] = torch.mv(h[hv], b_q).to(o.dtype)
+
+        # Save state back
+        initial_state[state_idx] = h.to(initial_state.dtype)
+
+    return o, initial_state
+
+
 KVCache = tuple[torch.Tensor, torch.Tensor]
 
 
@@ -733,17 +883,52 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 metadata=attn_metadata,
             ).transpose(0, 1)
         elif attn_metadata.num_decodes > 0:
-            mixed_qkv_non_spec = causal_conv1d_update(
-                mixed_qkv_non_spec,
-                conv_state,
-                conv_weights,
-                self.conv1d.bias,
-                self.activation,
-                conv_state_indices=non_spec_state_indices_tensor[
-                    : attn_metadata.num_actual_tokens
-                ],
-                validate_data=True,
-            )
+            _use_pytorch_ref = _GDN_PYTORCH_DECODE and current_platform.is_xpu()
+            if _use_pytorch_ref:
+                global _gdn_decode_step_count
+                _is_first_layer = self.layer_idx == 0
+                if _is_first_layer:
+                    _gdn_decode_step_count += 1
+                if _GDN_DEBUG and self.layer_idx <= 2 and _gdn_decode_step_count <= 2:
+                    logger.info(
+                        "GDN decode step %d layer %d: "
+                        "conv_state[idx0] abs_mean=%.6f, "
+                        "ssm_state[idx0] abs_mean=%.6f, "
+                        "indices=%s",
+                        _gdn_decode_step_count,
+                        self.layer_idx,
+                        conv_state[
+                            non_spec_state_indices_tensor[0].item()
+                        ].abs().mean().item(),
+                        ssm_state[
+                            non_spec_state_indices_tensor[0].item()
+                        ].abs().mean().item(),
+                        non_spec_state_indices_tensor[
+                            : attn_metadata.num_actual_tokens
+                        ].tolist(),
+                    )
+                mixed_qkv_non_spec = _causal_conv1d_update_pytorch_ref(
+                    mixed_qkv_non_spec,
+                    conv_state,
+                    conv_weights,
+                    self.conv1d.bias,
+                    self.activation,
+                    conv_state_indices=non_spec_state_indices_tensor[
+                        : attn_metadata.num_actual_tokens
+                    ],
+                )
+            else:
+                mixed_qkv_non_spec = causal_conv1d_update(
+                    mixed_qkv_non_spec,
+                    conv_state,
+                    conv_weights,
+                    self.conv1d.bias,
+                    self.activation,
+                    conv_state_indices=non_spec_state_indices_tensor[
+                        : attn_metadata.num_actual_tokens
+                    ],
+                    validate_data=True,
+                )
         else:
             mixed_qkv_non_spec = None
 
@@ -809,28 +994,91 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 use_qk_l2norm_in_kernel=True,
             )
             # Init cache
-            ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
-                ssm_state.dtype
-            )
-        elif attn_metadata.num_decodes > 0:
-            core_attn_out_non_spec, last_recurrent_state = (
-                fused_sigmoid_gating_delta_rule_update(
+            # On XPU, the FLA chunk_gated_delta_rule Triton kernel can
+            # produce NaN in the final state even when output is correct.
+            # Fix: recompute final state using PyTorch sequential reference.
+            _has_nan_state = torch.isnan(last_recurrent_state).any().item()
+            if _has_nan_state and (_GDN_PYTORCH_DECODE or current_platform.is_xpu()):
+                if _GDN_DEBUG:
+                    logger.warning(
+                        "GDN prefill layer %d: chunk kernel produced NaN "
+                        "in final state. Recomputing with PyTorch ref. "
+                        "cu_seqlens=%s",
+                        self.layer_idx,
+                        non_spec_query_start_loc.tolist(),
+                    )
+                # Recompute final state using sequential reference
+                recomputed_state = initial_state.clone()
+                _fused_sigmoid_gating_delta_rule_update_pytorch_ref(
                     A_log=self.A_log,
-                    a=a,
-                    b=b,
+                    a=a[:core_attn_out_non_spec.shape[1]],
+                    b=b[:core_attn_out_non_spec.shape[1]],
                     dt_bias=self.dt_bias,
                     q=query_non_spec,
                     k=key_non_spec,
                     v=value_non_spec,
-                    initial_state=ssm_state,
-                    inplace_final_state=True,
-                    cu_seqlens=non_spec_query_start_loc[
-                        : attn_metadata.num_decodes + 1
-                    ],
-                    ssm_state_indices=non_spec_state_indices_tensor,
-                    use_qk_l2norm_in_kernel=True,
+                    initial_state=recomputed_state,
+                    cu_seqlens=non_spec_query_start_loc,
+                    ssm_state_indices=torch.arange(
+                        recomputed_state.shape[0],
+                        device=recomputed_state.device,
+                    ),
+                    use_qk_l2norm=True,
                 )
+                last_recurrent_state = recomputed_state
+            ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
+                ssm_state.dtype
             )
+        elif attn_metadata.num_decodes > 0:
+            _use_pytorch_ref = _GDN_PYTORCH_DECODE and current_platform.is_xpu()
+            if _use_pytorch_ref:
+                core_attn_out_non_spec, last_recurrent_state = (
+                    _fused_sigmoid_gating_delta_rule_update_pytorch_ref(
+                        A_log=self.A_log,
+                        a=a,
+                        b=b,
+                        dt_bias=self.dt_bias,
+                        q=query_non_spec,
+                        k=key_non_spec,
+                        v=value_non_spec,
+                        initial_state=ssm_state,
+                        cu_seqlens=non_spec_query_start_loc[
+                            : attn_metadata.num_decodes + 1
+                        ],
+                        ssm_state_indices=non_spec_state_indices_tensor,
+                        use_qk_l2norm=True,
+                    )
+                )
+                if _GDN_DEBUG and self.layer_idx <= 2 and _gdn_decode_step_count <= 2:
+                    logger.info(
+                        "GDN decode step %d layer 0 (pytorch ref): "
+                        "recurrent output abs_mean=%.6f, "
+                        "ssm_state[idx0] abs_mean=%.6f",
+                        _gdn_decode_step_count,
+                        core_attn_out_non_spec.abs().mean().item(),
+                        ssm_state[
+                            non_spec_state_indices_tensor[0].item()
+                        ].abs().mean().item(),
+                    )
+            else:
+                core_attn_out_non_spec, last_recurrent_state = (
+                    fused_sigmoid_gating_delta_rule_update(
+                        A_log=self.A_log,
+                        a=a,
+                        b=b,
+                        dt_bias=self.dt_bias,
+                        q=query_non_spec,
+                        k=key_non_spec,
+                        v=value_non_spec,
+                        initial_state=ssm_state,
+                        inplace_final_state=True,
+                        cu_seqlens=non_spec_query_start_loc[
+                            : attn_metadata.num_decodes + 1
+                        ],
+                        ssm_state_indices=non_spec_state_indices_tensor,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+                )
         else:
             core_attn_out_non_spec, last_recurrent_state = None, None
 
@@ -1077,6 +1325,20 @@ class Qwen3NextDecoderLayer(nn.Module):
         else:
             raise ValueError("Invalid layer_type")
         hidden_states = self_attention_output
+
+        if _GDN_DEBUG and self.layer_idx <= 7 and _gdn_decode_step_count <= 2:
+            _has_nan = torch.isnan(hidden_states).any().item()
+            _abs_mean = hidden_states.abs().mean().item()
+            logger.info(
+                "Layer %d (%s) step %d: output abs_mean=%.6f, has_nan=%s, "
+                "shape=%s",
+                self.layer_idx,
+                self.layer_type,
+                _gdn_decode_step_count,
+                _abs_mean,
+                _has_nan,
+                list(hidden_states.shape),
+            )
 
         if self.layer_scale:
             if len(hidden_states.shape) == 2:

@@ -179,8 +179,20 @@ class KVBlockZeroer:
             pin_memory=self.pin_memory,
         )
         self._ids_gpu = torch.empty(self._id_cap, dtype=torch.int64, device=self.device)
+        try:
+            seg_addrs_tensor = torch.tensor(
+                seg_addrs, dtype=torch.int64, device=self.device
+            )
+        except (ValueError, OverflowError):
+            # XPU data pointers can exceed signed int64 range.
+            # Reinterpret as unsigned → signed via numpy.
+            import numpy as np
+
+            seg_addrs_tensor = torch.from_numpy(
+                np.array(seg_addrs, dtype=np.uint64).view(np.int64)
+            ).to(self.device)
         self._meta = (
-            torch.tensor(seg_addrs, dtype=torch.int64, device=self.device),
+            seg_addrs_tensor,
             page_size_el,
             blk_size,
             len(seg_addrs),
