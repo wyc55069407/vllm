@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import math
 from copy import deepcopy
 from math import lcm
 from typing import TYPE_CHECKING
@@ -216,6 +217,19 @@ class HybridAttentionMambaModelConfig(VerifyAndUpdateConfig):
             attn_block_size = kernel_block_alignment_size * cdiv(
                 mamba_page_size, kernel_block_alignment_size * attn_page_size_1_token
             )
+
+        # On XPU, round up to next power of 2 for better alignment
+        # with attention backends (Triton ATTN kernel performance).
+        # XPU FA2 only supports block_size up to 64 which is too small
+        # for hybrid models, so we use Triton ATTN with power-of-2 sizes.
+        if current_platform.is_xpu() and attn_block_size > 64:
+            po2 = 2 ** math.ceil(math.log2(attn_block_size))
+            logger.info(
+                "XPU: rounding hybrid attention block_size from %d "
+                "to next power of 2: %d",
+                attn_block_size, po2,
+            )
+            attn_block_size = po2
 
         # override attention block size if it is too small,
         # even if the user has explicitly set it
@@ -610,6 +624,9 @@ class Qwen3_5ForConditionalGenerationConfig(VerifyAndUpdateConfig):
         (or not explicitly set), to the value specified in the HF config's
         mamba_ssm_dtype field. Warn if the user explicitly overrides it to a
         different value.
+
+        Also align attention and mamba page sizes for hybrid KV cache
+        (the model has both full_attention and linear_attention layers).
         """
         cache_config = vllm_config.cache_config
         hf_text_config = vllm_config.model_config.hf_text_config
@@ -628,6 +645,11 @@ class Qwen3_5ForConditionalGenerationConfig(VerifyAndUpdateConfig):
                 mamba_ssm_dtype,
                 cache_config.mamba_ssm_cache_dtype,
             )
+
+        # Note: HybridAttentionMambaModelConfig.verify_and_update_config()
+        # is called automatically by try_verify_and_update_config() for
+        # all hybrid models (in vllm/config/vllm.py). No need to call
+        # it here.
 
 
 class SnowflakeGteNewModelConfig(VerifyAndUpdateConfig):

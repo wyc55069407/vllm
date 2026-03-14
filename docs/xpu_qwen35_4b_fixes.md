@@ -48,11 +48,28 @@ Additionally added `_causal_conv1d_update_pytorch_ref` as a fallback for the con
 
 **Fix**: Added PyTorch-native dequantization fallback that unpacks INT4/INT8 weights and applies group-wise scaling on XPU.
 
+### 7. Hybrid Block Size Power-of-2 Rounding (`vllm/model_executor/models/config.py`)
+
+**Problem**: The computed hybrid block_size (528) is not a power of 2. While Triton ATTN accepts it, power-of-2 sizes are preferred for memory alignment and kernel performance.
+
+**Fix**: On XPU, when the hybrid block_size exceeds 64 (the FA2 maximum), round up to the next power of 2 (528 → 1024). This uses Triton ATTN and pads mamba pages by ~95% (2.1MB → 4.1MB), which is acceptable given the small model size.
+
+| block_size | Backend | Mamba padding | Notes |
+|-----------|---------|---------------|-------|
+| 64 | FA2 | N/A (doesn't fit) | **Incompatible**: mamba state 2.1MB > page 256KB |
+| 528 | Triton | 0.8% | Original: minimal waste, non-power-of-2 |
+| 1024 | Triton | 95.4% | **Current**: power-of-2, ~2MB extra per mamba page |
+
 ## Why FA2 Backend Cannot Work with Hybrid Models
 
-The XPU FA2 kernel requires `block_size=64` for paged attention. Hybrid models require `block_size=528` to store GDN recurrent state in the unified page. These are mutually exclusive because block_size is a system-wide parameter in vLLM's KV cache allocator.
+The XPU FA2 kernel requires `block_size=64` for paged attention. FA2 also restricts hybrid models to `[16, 32, 64]` to avoid a NaN propagation bug (flash-attention#1974). Hybrid models like Qwen3.5-4B require `block_size>=528` to fit the 2.1MB GDN recurrent state into one unified page.
 
-The Triton attention backend supports arbitrary block sizes, making it the correct choice for hybrid models on XPU.
+These constraints are fundamentally incompatible:
+- FA2 max block_size for hybrid: 64 → page size: 64 × 4096 = 256KB
+- Mamba state minimum: 2,096KB
+- No block_size in FA2's supported range can contain the mamba state
+
+The Triton attention backend supports arbitrary block sizes, making it the correct choice for hybrid models on XPU. With the power-of-2 fix, block_size=1024 provides clean alignment.
 
 ## How to Run
 
@@ -144,7 +161,8 @@ The ssm_state in float32 dominates: 2048 KB out of 2096 KB total (97.7%).
 |------|--------|
 | `vllm/_xpu_ops.py` | K/V contiguity for hybrid models |
 | `vllm/model_executor/layers/fla/ops/utils.py` | XPU device context in input_guard |
-| `vllm/model_executor/layers/quantization/gptq.py` | PyTorch GPTQ dequant fallback for XPU |
+| `vllm/model_executor/layers/quantization/gptq.py` | PyTorch GPTQ dequant fallback + oneDNN W4A16 |
+| `vllm/model_executor/models/config.py` | Power-of-2 hybrid block_size rounding on XPU |
 | `vllm/model_executor/models/qwen3_next.py` | NaN state repair + PyTorch reference kernels |
 | `vllm/platforms/xpu.py` | Allow block_size >= 64 for hybrid models |
 | `vllm/v1/worker/utils.py` | int64 overflow fix for XPU data pointers |
