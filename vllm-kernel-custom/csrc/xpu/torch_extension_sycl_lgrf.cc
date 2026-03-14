@@ -36,6 +36,24 @@ TORCH_LIBRARY_FRAGMENT(vllm_kernel_custom, m) {
         "int qk_dim, int v_dim, "
         "float attn_scale) -> Tensor");
   m.impl("esimd_sdp_mla_lgrf", torch::kXPU, &esimd_sdp_mla_lgrf);
+
+  /* === GDN (Gated Delta Network) state update === */
+  m.def("esimd_gdn_update(Tensor A_log, Tensor dt_bias, "
+        "Tensor a, Tensor b, Tensor q, Tensor k, Tensor v, "
+        "Tensor state, Tensor output, "
+        "Tensor cu_seqlens, Tensor state_indices, "
+        "int N, int H, int HV, int K, int V, "
+        "float scale, int inplace_state) -> Tensor");
+  m.impl("esimd_gdn_update", torch::kXPU, &esimd_gdn_update);
+
+  /* === Paged SDP (decode + prefill with causal mask) === */
+  m.def("esimd_sdp_paged(Tensor query, Tensor kv_cache, Tensor output, "
+        "Tensor block_table, Tensor seq_lens, Tensor query_start_loc, "
+        "int num_heads, int num_kv_heads, "
+        "int head_dim, int block_size, "
+        "int max_seq_len, float attn_scale, "
+        "int causal) -> Tensor");
+  m.impl("esimd_sdp_paged", torch::kXPU, &esimd_sdp_paged);
 }
 
 REGISTER_EXTENSION(common_ops_lgrf)

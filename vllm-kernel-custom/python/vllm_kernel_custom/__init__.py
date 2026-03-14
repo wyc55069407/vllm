@@ -45,6 +45,8 @@ from vllm_kernel_custom.esimd_ops import (
     esimd_sdp_bf16,
     esimd_sdp_bf16io,
     esimd_sdp_mla_lgrf,
+    esimd_sdp_paged,
+    esimd_gdn_update,
 )
 
 from vllm_kernel_custom.version import __version__

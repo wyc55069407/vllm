@@ -22,6 +22,8 @@ using namespace sycl::ext::intel::experimental::esimd;
 #include "esimd_kernels/flash.attn.b.mha128.fp16.opt.h"
 #include "esimd_kernels/flash.attn.b.mha128.bf16.h"
 #include "esimd_kernels/flash.attn.b.mha128.bf16io.h"
+#include "esimd_kernels/gdn_update.h"
+#include "esimd_kernels/sdp_paged.h"
 
 ESIMD_INLINE void esimd_mul_impl(uint8_t* a, uint8_t* b, uint8_t* c, int64_t len, nd_item<1>& ndi) {
 
@@ -397,5 +399,144 @@ at::Tensor esimd_sdp_bf16io(
         (uint8_t*)Q.data_ptr(), (uint8_t*)K.data_ptr(), (uint8_t*)V.data_ptr(),
         (uint8_t*)norm_alpha.data_ptr(), (uint8_t*)output.data_ptr(),
         (uint32_t)q_len, (uint32_t)kv_len, (uint32_t)head_q, (uint32_t)head_kv);
+    return output;
+}
+
+/* ============================================================
+ * GDN (Gated Delta Network) state update kernel
+ * One ESIMD thread per (sequence, value_head).
+ * ============================================================ */
+at::Tensor esimd_gdn_update(
+    at::Tensor A_log,          // [HV] f32
+    at::Tensor dt_bias,        // [HV] f32
+    at::Tensor a,              // [T_total, HV] bf16
+    at::Tensor b,              // [T_total, HV] bf16
+    at::Tensor q,              // [T_total, H, K] bf16
+    at::Tensor k,              // [T_total, H, K] bf16
+    at::Tensor v,              // [T_total, HV, V] bf16
+    at::Tensor state,          // [num_states, HV, V, K] f32
+    at::Tensor output,         // [T_total, HV, V] bf16
+    at::Tensor cu_seqlens,     // [N+1] int32
+    at::Tensor state_indices,  // [N] int32
+    int64_t N, int64_t H, int64_t HV,
+    int64_t K, int64_t V,
+    double scale,
+    int64_t inplace_state)
+{
+    auto stream = at::xpu::getCurrentXPUStream();
+    auto& dpcpp_queue = stream.queue();
+
+    int64_t num_threads = N * HV;
+    sycl::range<1> GlobalRange(num_threads);
+    sycl::range<1> LocalRange(1);
+    sycl::nd_range<1> Range(GlobalRange, LocalRange);
+
+    auto* A_log_ptr     = A_log.data_ptr<float>();
+    auto* dt_bias_ptr   = dt_bias.data_ptr<float>();
+    auto* a_ptr         = reinterpret_cast<const unsigned short*>(a.data_ptr());
+    auto* b_ptr         = reinterpret_cast<const unsigned short*>(b.data_ptr());
+    auto* q_ptr         = reinterpret_cast<const unsigned short*>(q.data_ptr());
+    auto* k_ptr         = reinterpret_cast<const unsigned short*>(k.data_ptr());
+    auto* v_ptr         = reinterpret_cast<const unsigned short*>(v.data_ptr());
+    auto* state_ptr     = state.data_ptr<float>();
+    auto* output_ptr    = reinterpret_cast<unsigned short*>(output.data_ptr());
+    auto* cu_seqlens_ptr = cu_seqlens.data_ptr<int>();
+    auto* state_idx_ptr = state_indices.data_ptr<int>();
+
+    int n_val = (int)N, h_val = (int)H, hv_val = (int)HV;
+    int k_val = (int)K, v_val = (int)V;
+    float scale_f = (float)scale;
+    int inplace = (int)inplace_state;
+
+    dpcpp_queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(Range, [=](sycl::nd_item<1> ndi) SYCL_ESIMD_KERNEL {
+            gdn_update_kernel(
+                A_log_ptr, dt_bias_ptr,
+                a_ptr, b_ptr, q_ptr, k_ptr, v_ptr,
+                state_ptr, output_ptr,
+                cu_seqlens_ptr, state_idx_ptr,
+                n_val, h_val, hv_val, k_val, v_val,
+                scale_f, inplace, ndi);
+        });
+    });
+
+    return output;
+}
+
+/* ============================================================
+ * Paged SDP (Scaled Dot-Product) Attention — decode + prefill
+ * One ESIMD thread per (request, head) for decode,
+ * or per (token, head) for prefill.
+ * ============================================================ */
+at::Tensor esimd_sdp_paged(
+    at::Tensor query,           // [num_tokens, num_heads, head_dim] bf16
+    at::Tensor kv_cache,        // [2, num_blocks, block_size, num_kv_heads, head_dim] bf16
+    at::Tensor output,          // [num_tokens, num_heads, head_dim] bf16
+    at::Tensor block_table,     // [batch, max_blocks_per_seq] i32
+    at::Tensor seq_lens,        // [batch] i32
+    at::Tensor query_start_loc, // [batch+1] i32
+    int64_t num_heads, int64_t num_kv_heads,
+    int64_t head_dim, int64_t block_size,
+    int64_t max_seq_len, double attn_scale,
+    int64_t causal)
+{
+    auto stream = at::xpu::getCurrentXPUStream();
+    auto& dpcpp_queue = stream.queue();
+
+    int batch = (int)seq_lens.size(0);
+    int num_tokens = (int)query.size(0);
+    int max_blocks_per_seq = (int)block_table.size(1);
+    int num_blocks_total = (int)kv_cache.size(1);
+
+    // Determine max_query_len to select decode vs prefill mode
+    int max_query_len = 0;
+    // In decode: num_tokens == batch, max_query_len == 1
+    // In prefill: max_query_len > 1
+    if (num_tokens == batch) {
+        max_query_len = 1;
+    } else {
+        // Mixed or prefill — compute from query_start_loc
+        // For simplicity, pass max_query_len from the metadata
+        // Here we estimate: total_tokens / batch (approx)
+        max_query_len = (num_tokens + batch - 1) / batch;
+        if (max_query_len <= 1) max_query_len = 2;  // force prefill path
+    }
+
+    int64_t num_threads = (int64_t)num_tokens * num_heads;
+    sycl::range<1> GlobalRange(num_threads);
+    sycl::range<1> LocalRange(1);
+    sycl::nd_range<1> Range(GlobalRange, LocalRange);
+
+    auto* query_us       = reinterpret_cast<const unsigned short*>(query.data_ptr());
+    auto* kv_cache_us    = reinterpret_cast<const unsigned short*>(kv_cache.data_ptr());
+    auto* output_us      = reinterpret_cast<unsigned short*>(output.data_ptr());
+    auto* block_table_i  = block_table.data_ptr<int>();
+    auto* seq_lens_i     = seq_lens.data_ptr<int>();
+    auto* qsl_i          = query_start_loc.data_ptr<int>();
+
+    int nh = (int)num_heads, nkvh = (int)num_kv_heads, hd = (int)head_dim;
+    int bs = (int)block_size, mbps = max_blocks_per_seq;
+    float as_f = (float)attn_scale;
+    int c_val = (int)causal, mql = max_query_len;
+
+    // Extract KV cache strides (in bf16 elements) from the tensor.
+    // Logical shape: [2, num_blocks, block_size, num_kv_heads, head_dim]
+    // Strides may differ from contiguous if vLLM permutes the physical layout.
+    int64_t kv_s0 = kv_cache.stride(0);  // split (K vs V)
+    int64_t kv_s1 = kv_cache.stride(1);  // block
+    int64_t kv_s2 = kv_cache.stride(2);  // position within block
+    int64_t kv_s3 = kv_cache.stride(3);  // kv head
+
+    dpcpp_queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(Range, [=](sycl::nd_item<1> ndi) SYCL_ESIMD_KERNEL {
+            sdp_paged_kernel(
+                query_us, kv_cache_us, output_us,
+                block_table_i, seq_lens_i, qsl_i,
+                nh, nkvh, hd, bs, mbps,
+                kv_s0, kv_s1, kv_s2, kv_s3,
+                as_f, c_val, mql, ndi);
+        });
+    });
+
     return output;
 }

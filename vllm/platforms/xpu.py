@@ -66,6 +66,9 @@ class XPUPlatform(Platform):
         if attn_selector_config.use_mla:
             logger.info_once("Using Triton MLA backend on V1 engine.")
             return AttentionBackendEnum.TRITON_MLA.get_path()
+        if selected_backend == AttentionBackendEnum.ESIMD_ATTN:
+            logger.info_once("Using ESIMD Attention backend.")
+            return AttentionBackendEnum.ESIMD_ATTN.get_path()
         if selected_backend == AttentionBackendEnum.TRITON_ATTN:
             logger.info_once("Using Triton backend.")
             return AttentionBackendEnum.TRITON_ATTN.get_path()

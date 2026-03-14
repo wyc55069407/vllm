@@ -242,3 +242,22 @@ at::Tensor esimd_sdp_mla_lgrf(
     int64_t extend_seq_len, int64_t prefix_seq_len,
     int64_t qk_dim, int64_t v_dim,
     double attn_scale);
+
+// Paged SDP attention — decode + prefill with causal masking (large GRF)
+at::Tensor esimd_sdp_paged(
+    at::Tensor query, at::Tensor kv_cache, at::Tensor output,
+    at::Tensor block_table, at::Tensor seq_lens, at::Tensor query_start_loc,
+    int64_t num_heads, int64_t num_kv_heads,
+    int64_t head_dim, int64_t block_size,
+    int64_t max_seq_len, double attn_scale,
+    int64_t causal);
+
+// GDN (Gated Delta Network) state update (large GRF)
+at::Tensor esimd_gdn_update(
+    at::Tensor A_log, at::Tensor dt_bias,
+    at::Tensor a, at::Tensor b, at::Tensor q, at::Tensor k, at::Tensor v,
+    at::Tensor state, at::Tensor output,
+    at::Tensor cu_seqlens, at::Tensor state_indices,
+    int64_t N, int64_t H, int64_t HV,
+    int64_t K, int64_t V,
+    double scale, int64_t inplace_state);

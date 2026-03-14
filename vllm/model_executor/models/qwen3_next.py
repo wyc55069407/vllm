@@ -106,7 +106,22 @@ logger = init_logger(__name__)
 import os
 _GDN_DEBUG = os.environ.get("VLLM_GDN_DEBUG", "0") == "1"
 _GDN_PYTORCH_DECODE = os.environ.get("VLLM_GDN_PYTORCH_DECODE", "0") == "1"
+_GDN_ESIMD = os.environ.get("VLLM_GDN_ESIMD", "0") == "1"
 _gdn_decode_step_count = 0
+
+# Lazy-loaded ESIMD GDN kernel
+_esimd_gdn_update = None
+
+def _get_esimd_gdn():
+    """Lazy-load ESIMD GDN kernel from vllm-kernel-custom."""
+    global _esimd_gdn_update
+    if _esimd_gdn_update is None:
+        try:
+            from vllm_kernel_custom import esimd_gdn_update
+            _esimd_gdn_update = esimd_gdn_update
+        except ImportError:
+            _esimd_gdn_update = False  # Mark as unavailable
+    return _esimd_gdn_update if _esimd_gdn_update is not False else None
 
 
 def _causal_conv1d_update_pytorch_ref(
@@ -979,106 +994,183 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         if attn_metadata.num_prefills > 0:
             initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
             initial_state[~has_initial_state, ...] = 0
-            (
-                core_attn_out_non_spec,
-                last_recurrent_state,
-            ) = self.chunk_gated_delta_rule(
-                q=query_non_spec,
-                k=key_non_spec,
-                v=value_non_spec,
-                g=g_non_spec,
-                beta=beta_non_spec,
-                initial_state=initial_state,
-                output_final_state=True,
-                cu_seqlens=non_spec_query_start_loc,
-                use_qk_l2norm_in_kernel=True,
-            )
-            # Init cache
-            # On XPU, the FLA chunk_gated_delta_rule Triton kernel can
-            # produce NaN in the final state even when output is correct.
-            # Fix: recompute final state using PyTorch sequential reference.
-            _has_nan_state = torch.isnan(last_recurrent_state).any().item()
-            if _has_nan_state and (_GDN_PYTORCH_DECODE or current_platform.is_xpu()):
-                if _GDN_DEBUG:
-                    logger.warning(
-                        "GDN prefill layer %d: chunk kernel produced NaN "
-                        "in final state. Recomputing with PyTorch ref. "
-                        "cu_seqlens=%s",
-                        self.layer_idx,
+            _esimd_fn = _get_esimd_gdn() if _GDN_ESIMD else None
+            if _esimd_fn is not None:
+                # ESIMD path: computes both output and correct final state
+                # Squeeze batch dim: [1, T, H, K] -> [T, H, K]
+                q_3d = query_non_spec.squeeze(0)
+                k_3d = key_non_spec.squeeze(0)
+                v_3d = value_non_spec.squeeze(0)
+                T_ns, H_ns, K_ns = q_3d.shape
+                HV_ns = v_3d.shape[1]
+                V_ns = v_3d.shape[2]
+                N_ns = non_spec_query_start_loc.shape[0] - 1
+                esimd_output = torch.zeros_like(v_3d)
+                esimd_state_indices = torch.arange(
+                    N_ns, dtype=torch.int32,
+                    device=q_3d.device,
+                )
+                # ESIMD kernel requires f32 state; convert if needed
+                _state_orig_dtype = initial_state.dtype
+                if _state_orig_dtype != torch.float32:
+                    initial_state = initial_state.float()
+                if _GDN_DEBUG and self.layer_idx == 0:
+                    logger.info(
+                        "ESIMD GDN prefill layer %d: "
+                        "T=%d H=%d HV=%d K=%d V=%d N=%d "
+                        "state_dtype=%s cu_seqlens=%s",
+                        self.layer_idx, T_ns, H_ns, HV_ns, K_ns, V_ns, N_ns,
+                        _state_orig_dtype,
                         non_spec_query_start_loc.tolist(),
                     )
-                # Recompute final state using sequential reference
-                recomputed_state = initial_state.clone()
-                _fused_sigmoid_gating_delta_rule_update_pytorch_ref(
-                    A_log=self.A_log,
-                    a=a[:core_attn_out_non_spec.shape[1]],
-                    b=b[:core_attn_out_non_spec.shape[1]],
-                    dt_bias=self.dt_bias,
+                _esimd_fn(
+                    self.A_log.float(), self.dt_bias.float(),
+                    a[:T_ns], b[:T_ns],
+                    q_3d, k_3d, v_3d,
+                    initial_state, esimd_output,
+                    non_spec_query_start_loc.to(torch.int32),
+                    esimd_state_indices,
+                    N_ns, H_ns, HV_ns, K_ns, V_ns,
+                    float(K_ns ** -0.5), 1,  # inplace_state=1
+                )
+                core_attn_out_non_spec = esimd_output.unsqueeze(0)
+                last_recurrent_state = initial_state
+            else:
+                (
+                    core_attn_out_non_spec,
+                    last_recurrent_state,
+                ) = self.chunk_gated_delta_rule(
                     q=query_non_spec,
                     k=key_non_spec,
                     v=value_non_spec,
-                    initial_state=recomputed_state,
+                    g=g_non_spec,
+                    beta=beta_non_spec,
+                    initial_state=initial_state,
+                    output_final_state=True,
                     cu_seqlens=non_spec_query_start_loc,
-                    ssm_state_indices=torch.arange(
-                        recomputed_state.shape[0],
-                        device=recomputed_state.device,
-                    ),
-                    use_qk_l2norm=True,
+                    use_qk_l2norm_in_kernel=True,
                 )
-                last_recurrent_state = recomputed_state
+                # On XPU, the FLA chunk_gated_delta_rule Triton kernel can
+                # produce NaN in the final state even when output is correct.
+                # Fix: recompute final state using PyTorch sequential ref.
+                _has_nan_state = torch.isnan(
+                    last_recurrent_state).any().item()
+                if _has_nan_state and (
+                    _GDN_PYTORCH_DECODE or current_platform.is_xpu()
+                ):
+                    if _GDN_DEBUG:
+                        logger.warning(
+                            "GDN prefill layer %d: chunk kernel produced "
+                            "NaN in final state. Recomputing with PyTorch "
+                            "ref. cu_seqlens=%s",
+                            self.layer_idx,
+                            non_spec_query_start_loc.tolist(),
+                        )
+                    recomputed_state = initial_state.clone()
+                    _fused_sigmoid_gating_delta_rule_update_pytorch_ref(
+                        A_log=self.A_log,
+                        a=a[:core_attn_out_non_spec.shape[1]],
+                        b=b[:core_attn_out_non_spec.shape[1]],
+                        dt_bias=self.dt_bias,
+                        q=query_non_spec,
+                        k=key_non_spec,
+                        v=value_non_spec,
+                        initial_state=recomputed_state,
+                        cu_seqlens=non_spec_query_start_loc,
+                        ssm_state_indices=torch.arange(
+                            recomputed_state.shape[0],
+                            device=recomputed_state.device,
+                        ),
+                        use_qk_l2norm=True,
+                    )
+                    last_recurrent_state = recomputed_state
             ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
                 ssm_state.dtype
             )
         elif attn_metadata.num_decodes > 0:
-            _use_pytorch_ref = _GDN_PYTORCH_DECODE and current_platform.is_xpu()
-            if _use_pytorch_ref:
-                core_attn_out_non_spec, last_recurrent_state = (
-                    _fused_sigmoid_gating_delta_rule_update_pytorch_ref(
-                        A_log=self.A_log,
-                        a=a,
-                        b=b,
-                        dt_bias=self.dt_bias,
-                        q=query_non_spec,
-                        k=key_non_spec,
-                        v=value_non_spec,
-                        initial_state=ssm_state,
-                        cu_seqlens=non_spec_query_start_loc[
-                            : attn_metadata.num_decodes + 1
-                        ],
-                        ssm_state_indices=non_spec_state_indices_tensor,
-                        use_qk_l2norm=True,
-                    )
+            _esimd_fn = _get_esimd_gdn() if _GDN_ESIMD else None
+            if _esimd_fn is not None:
+                # ESIMD decode path — squeeze batch dim
+                q_3d = query_non_spec.squeeze(0)
+                k_3d = key_non_spec.squeeze(0)
+                v_3d = value_non_spec.squeeze(0)
+                T_dec, H_dec, K_dec = q_3d.shape
+                HV_dec = v_3d.shape[1]
+                V_dec = v_3d.shape[2]
+                N_dec = attn_metadata.num_decodes
+                esimd_output = torch.zeros_like(v_3d)
+                _dec_cu = non_spec_query_start_loc[:N_dec + 1].to(
+                    torch.int32)
+                _dec_si = non_spec_state_indices_tensor.to(torch.int32)
+                # ESIMD kernel requires f32 state; extract, convert,
+                # run kernel, then write back
+                _state_f32 = ssm_state[_dec_si].float().contiguous()
+                _local_si = torch.arange(
+                    N_dec, dtype=torch.int32, device=q_3d.device)
+                _esimd_fn(
+                    self.A_log.float(), self.dt_bias.float(),
+                    a[:T_dec], b[:T_dec],
+                    q_3d, k_3d, v_3d,
+                    _state_f32, esimd_output,
+                    _dec_cu, _local_si,
+                    N_dec, H_dec, HV_dec, K_dec, V_dec,
+                    float(K_dec ** -0.5), 1,  # inplace_state=1
                 )
-                if _GDN_DEBUG and self.layer_idx <= 2 and _gdn_decode_step_count <= 2:
-                    logger.info(
-                        "GDN decode step %d layer 0 (pytorch ref): "
-                        "recurrent output abs_mean=%.6f, "
-                        "ssm_state[idx0] abs_mean=%.6f",
-                        _gdn_decode_step_count,
-                        core_attn_out_non_spec.abs().mean().item(),
-                        ssm_state[
-                            non_spec_state_indices_tensor[0].item()
-                        ].abs().mean().item(),
-                    )
+                ssm_state[_dec_si] = _state_f32.to(ssm_state.dtype)
+                core_attn_out_non_spec = esimd_output.unsqueeze(0)
             else:
-                core_attn_out_non_spec, last_recurrent_state = (
-                    fused_sigmoid_gating_delta_rule_update(
-                        A_log=self.A_log,
-                        a=a,
-                        b=b,
-                        dt_bias=self.dt_bias,
-                        q=query_non_spec,
-                        k=key_non_spec,
-                        v=value_non_spec,
-                        initial_state=ssm_state,
-                        inplace_final_state=True,
-                        cu_seqlens=non_spec_query_start_loc[
-                            : attn_metadata.num_decodes + 1
-                        ],
-                        ssm_state_indices=non_spec_state_indices_tensor,
-                        use_qk_l2norm_in_kernel=True,
-                    )
+                _use_pytorch_ref = (
+                    _GDN_PYTORCH_DECODE and current_platform.is_xpu()
                 )
+                if _use_pytorch_ref:
+                    core_attn_out_non_spec, last_recurrent_state = (
+                        _fused_sigmoid_gating_delta_rule_update_pytorch_ref(
+                            A_log=self.A_log,
+                            a=a,
+                            b=b,
+                            dt_bias=self.dt_bias,
+                            q=query_non_spec,
+                            k=key_non_spec,
+                            v=value_non_spec,
+                            initial_state=ssm_state,
+                            cu_seqlens=non_spec_query_start_loc[
+                                : attn_metadata.num_decodes + 1
+                            ],
+                            ssm_state_indices=non_spec_state_indices_tensor,
+                            use_qk_l2norm=True,
+                        )
+                    )
+                    if (_GDN_DEBUG and self.layer_idx <= 2
+                            and _gdn_decode_step_count <= 2):
+                        logger.info(
+                            "GDN decode step %d layer 0 (pytorch ref): "
+                            "recurrent output abs_mean=%.6f, "
+                            "ssm_state[idx0] abs_mean=%.6f",
+                            _gdn_decode_step_count,
+                            core_attn_out_non_spec.abs().mean().item(),
+                            ssm_state[
+                                non_spec_state_indices_tensor[0].item()
+                            ].abs().mean().item(),
+                        )
+                else:
+                    core_attn_out_non_spec, last_recurrent_state = (
+                        fused_sigmoid_gating_delta_rule_update(
+                            A_log=self.A_log,
+                            a=a,
+                            b=b,
+                            dt_bias=self.dt_bias,
+                            q=query_non_spec,
+                            k=key_non_spec,
+                            v=value_non_spec,
+                            initial_state=ssm_state,
+                            inplace_final_state=True,
+                            cu_seqlens=non_spec_query_start_loc[
+                                : attn_metadata.num_decodes + 1
+                            ],
+                            ssm_state_indices=non_spec_state_indices_tensor,
+                            use_qk_l2norm_in_kernel=True,
+                        )
+                    )
         else:
             core_attn_out_non_spec, last_recurrent_state = None, None
 

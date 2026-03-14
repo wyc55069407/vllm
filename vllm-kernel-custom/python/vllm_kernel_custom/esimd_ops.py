@@ -426,3 +426,81 @@ def esimd_sdp_mla_lgrf(
                                     num_heads, num_heads_kv,
                                     extend_seq_len, prefix_seq_len,
                                     qk_dim, v_dim, attn_scale)
+
+
+def esimd_sdp_paged(
+    query: torch.Tensor, kv_cache: torch.Tensor, output: torch.Tensor,
+    block_table: torch.Tensor, seq_lens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_heads: int, num_kv_heads: int,
+    head_dim: int, block_size: int,
+    max_seq_len: int, attn_scale: float,
+    causal: int,
+) -> torch.Tensor:
+    """Paged SDP attention (LGRF, doubleGRF).
+
+    Handles both decode (query_len=1) and prefill (query_len>1) with
+    causal masking and paged KV cache.
+
+    Args:
+        query: [num_tokens, num_heads, head_dim] bf16
+        kv_cache: [2, num_blocks, block_size, num_kv_heads, head_dim] bf16 (NHD)
+        output: [num_tokens, num_heads, head_dim] bf16 — output buffer
+        block_table: [batch, max_blocks_per_seq] i32
+        seq_lens: [batch] i32 — total KV length per request
+        query_start_loc: [batch+1] i32 — cumulative query token offsets
+        num_heads: number of query heads
+        num_kv_heads: number of KV heads (GQA)
+        head_dim: 128 or 256
+        block_size: KV cache block size (power of 2)
+        max_seq_len: maximum sequence length in batch
+        attn_scale: 1/sqrt(head_dim)
+        causal: 1 for causal masking
+    """
+    return _ops.esimd_sdp_paged(
+        query, kv_cache, output,
+        block_table, seq_lens, query_start_loc,
+        num_heads, num_kv_heads,
+        head_dim, block_size,
+        max_seq_len, attn_scale, causal)
+
+
+def esimd_gdn_update(
+    A_log: torch.Tensor, dt_bias: torch.Tensor,
+    a: torch.Tensor, b: torch.Tensor,
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+    state: torch.Tensor, output: torch.Tensor,
+    cu_seqlens: torch.Tensor, state_indices: torch.Tensor,
+    N: int, H: int, HV: int, K: int, V: int,
+    scale: float, inplace_state: int,
+) -> torch.Tensor:
+    """GDN (Gated Delta Network) state update (LGRF, doubleGRF).
+
+    Replaces both Triton chunk_gated_delta_rule (NaN on XPU) and
+    PyTorch sequential fallback (slow). Handles both decode (T=1)
+    and prefill (T>1) via sequential token processing.
+
+    Args:
+        A_log: [HV] f32 — log decay parameters
+        dt_bias: [HV] f32 — softplus bias
+        a: [T_total, HV] bf16 — gate input
+        b: [T_total, HV] bf16 — beta input
+        q: [T_total, H, K] bf16 — query (H = query/key heads)
+        k: [T_total, H, K] bf16 — key
+        v: [T_total, HV, V] bf16 — value (HV = value heads)
+        state: [num_states, HV, V, K] f32 — recurrent state (updated in-place)
+        output: [T_total, HV, V] bf16 — output buffer
+        cu_seqlens: [N+1] i32 — cumulative sequence lengths
+        state_indices: [N] i32 — index into state for each sequence
+        N: number of sequences
+        H: number of query/key heads
+        HV: number of value heads
+        K: key dimension (128)
+        V: value dimension (128)
+        scale: attention scale (typically K^-0.5)
+        inplace_state: 1 to update state in-place
+    """
+    return _ops.esimd_gdn_update(
+        A_log, dt_bias, a, b, q, k, v,
+        state, output, cu_seqlens, state_indices,
+        N, H, HV, K, V, scale, inplace_state)
