@@ -21,11 +21,29 @@ Qwen3-30B-A3B is a Mixture-of-Experts (MoE) model with 128 experts (8 active per
 
 **Math**: 22.7GB total - 15.6GB model = ~7GB free. 48 layers × 136MB/layer KV cache = 6.5GB at 0.30 utilization.
 
-### 2. GPTQ Non-MoE Linear Layers (from Qwen3.5-4B fixes)
+### 2. GPTQ Non-MoE Linear Layers — oneDNN W4A16 INT4 GEMM
 
-**Problem**: GPTQ CUDA kernels (`ops.gptq_gemm`) unavailable on XPU. The `int4_gemm_w4a16` op in `_xpu_C` is also not present in the current `vllm_xpu_kernels` package.
+**Problem**: GPTQ CUDA kernels (`ops.gptq_gemm`) unavailable on XPU. The `int4_gemm_w4a16` op in `_xpu_C` is also not present in the current `vllm_xpu_kernels` package. The initial PyTorch dequant+`F.linear` fallback works but has overhead from separate dequantization.
 
-**Fix**: PyTorch dequantization fallback in `GPTQLinearMethod.apply()` — unpacks INT4 weights, applies group-wise scaling, then uses `F.linear` (→ oneMKL GEMM). This was already implemented for Qwen3.5-4B.
+**Fix (v2 — oneDNN native)**: Integrated `vllm-kernel-custom`'s `onednn_w4a16_int4` kernel for fused INT4 dequant+GEMM. This uses oneDNN's matmul primitive with `u4` weight type, group-wise K-scaled per-N scales, and optional zero points.
+
+**Weight format conversion** (`_convert_to_onednn_u4` in `gptq.py`):
+1. Unpack GPTQ `qweight` [K/8, N] int32 → [K, N] uint4 values
+2. Transpose to [N, K] and repack as oneDNN u4: [N, K/2] uint8 (2 values per byte, lower nibble first)
+3. Unpack `qzeros` [num_groups, N/8] int32 → [num_groups, N] uint4 values
+4. For GPTQ v1: add 1 to zero points (v1 offset convention)
+5. Repack zero points as oneDNN u4: [num_groups, N/2] uint8
+6. Convert scales [num_groups, N] fp16 → fp32
+
+**oneDNN primitive setup** (in `vllm-kernel-custom/csrc/xpu/onednn_fp8.sycl`):
+- Weight desc: `{K, N} u4 format_tag::ba` (physical [N,K])
+- Scales: `set_scales(DNNL_ARG_WEIGHTS, mask=3, groups={group_size, 1}, f32)` — K-grouped + per-N
+- Zero points: `set_zero_points(DNNL_ARG_WEIGHTS, mask=3, groups={group_size, 1}, u4)`
+- Supports FP16, BF16, and FP32 activations
+
+**Limitations**: Only works when `desc_act=false` (sequential K-groups). Falls back to dequant+`F.linear` when `desc_act=true` or `vllm-kernel-custom` is not installed.
+
+**Previous fix (v1)**: PyTorch dequantization fallback — unpacks INT4 weights, applies group-wise scaling, then uses `F.linear` (→ oneMKL). Still available as fallback.
 
 ### 3. MoE W4A16 Expert GEMM
 
@@ -50,29 +68,35 @@ This model uses standard full attention across all 48 layers with `block_size=64
 
 | Component | Kernel Used | Performance Level |
 |-----------|-------------|-------------------|
-| **Non-MoE Linear (GPTQ)** | PyTorch dequant + `F.linear` (oneMKL) | Functional, not optimal |
+| **Non-MoE Linear (GPTQ)** | oneDNN W4A16 INT4 GEMM (`vllm-kernel-custom`) | Native fused dequant+GEMM |
 | **MoE Expert GEMM (W4A16)** | Triton `fused_moe_kernel_gptq_awq` | Functional, default config |
 | **Attention** | XPU FA2 (`flash_attn_varlen_func`) | Optimized |
 | **RMSNorm, Embedding, etc.** | PyTorch native | Standard |
 
-### `vllm_xpu_kernels` Package Gaps
+### oneDNN W4A16 INT4 GEMM Details
 
-The installed `vllm_xpu_kernels` only provides `flash_attn_varlen_func`. Missing ops:
-- `int4_gemm_w4a16` — Would accelerate GPTQ non-MoE linear layers
-- `fp8_gemm_w8a16` — Would enable FP8 quantization path
-- No dedicated W4A16 MoE kernel (Triton fallback works)
+The `onednn_w4a16_int4` kernel in `vllm-kernel-custom` provides native INT4 GEMM:
+- Uses oneDNN matmul primitive with `u4` data type (available in oneDNN 3.7+ / oneAPI 2025.3)
+- Supports group-wise quantization: K-grouped + per-N scales via `set_scales(mask=3, groups={group_size, 1})`
+- Supports optional zero points via `set_zero_points(mask=3, groups={group_size, 1}, u4)`
+- Weight stored in physical [N,K] layout, 2 u4 values per byte
+- Dispatches FP16, BF16, FP32 activations
 
-### oneDNN / oneMKL W4A16 Support
+### `vllm-kernel-custom` Dependency
 
-- **GEMM (W4A16)**: `F.linear` dispatches to oneMKL for the FP16 matmul after dequantization. oneMKL handles the compute efficiently but the dequant step is separate overhead.
-- **MoE (W4A8)**: Not directly supported. The Triton MoE kernel handles W4A16 (weight int4, activation FP16). True W4A8 would require a custom kernel.
-- oneDNN primitive-level INT4 GEMM support exists in newer versions but is not exposed through PyTorch's XPU backend yet.
+The oneDNN W4A16 path requires `vllm-kernel-custom` to be installed. If not available, falls back to PyTorch dequant+`F.linear`. Build instructions:
+```bash
+cd ~/yuchen/vllm_env/vllm-kernel-custom
+source ~/intel/oneapi/setvars.sh --force
+export TORCH_XPU_ARCH_LIST=bmg-g21
+python setup_sycl.py clean && python setup_sycl.py install
+```
 
 ### Performance Optimization Path (Future)
 
-1. **Short term**: The current Triton MoE kernel + PyTorch dequant path works correctly
-2. **Medium term**: If `vllm_xpu_kernels` adds `int4_gemm_w4a16`, route GPTQ linear layers through `XPUwNa16LinearKernel` for fused dequant+GEMM
-3. **Long term**: Implement ESIMD/SYCL W4A16 MoE kernel in `vllm-kernel-custom` using oneDNN matmul primitives with int4 source type (available in oneDNN 3.7+)
+1. **Done**: oneDNN W4A16 INT4 GEMM for non-MoE GPTQ linear layers (fused dequant+GEMM)
+2. **Done**: Triton MoE W4A16 kernel works for expert GEMM
+3. **Future**: oneDNN-based W4A16 MoE kernel in `vllm-kernel-custom` for potentially better MoE performance
 
 ## How to Run
 
@@ -101,17 +125,34 @@ Notes:
 - No chunked prefill issues — standard attention, no GDN/linear attention
 - Loading takes ~4 minutes (16GB safetensors over IO)
 
-## Files Modified (Reused from Qwen3.5-4B)
+## Files Modified
 
-All code fixes for this model were already implemented in the `xpu-qwen35-4b-fixes` branch:
+### From Qwen3.5-4B fixes (reused):
 
 | File | Relevant Fix |
 |------|-------------|
-| `vllm/model_executor/layers/quantization/gptq.py` | PyTorch GPTQ dequant fallback for non-MoE linear layers |
+| `vllm/model_executor/layers/quantization/gptq.py` | PyTorch GPTQ dequant fallback + oneDNN W4A16 INT4 GEMM |
 | `vllm/v1/worker/utils.py` | int64 overflow fix for XPU data pointers |
 | `vllm/_xpu_ops.py` | K/V contiguity (not needed for this model but harmless) |
 
-New file:
+### oneDNN W4A16 integration (new):
+
+| File | Change |
+|------|--------|
+| `vllm/model_executor/layers/quantization/gptq.py` | Added `_convert_to_onednn_u4()` for GPTQ→oneDNN weight conversion; updated `apply()` to call `onednn_w4a16_int4` kernel |
+
+### External dependency (`vllm-kernel-custom`):
+
+| File | Change |
+|------|--------|
+| `csrc/xpu/onednn_fp8.sycl` | Added `onednn_w4a16_int4_impl` template + `onednn_w4a16_int4` wrapper |
+| `include/vllm_kernel_ops.h` | Added `onednn_w4a16_int4` declaration |
+| `csrc/xpu/torch_extension_sycl.cc` | Registered `onednn_w4a16_int4` torch op |
+| `python/vllm_kernel_custom/esimd_ops.py` | Added `onednn_w4a16_int4` Python wrapper |
+| `python/vllm_kernel_custom/__init__.py` | Added `onednn_w4a16_int4` to exports |
+
+### New files:
+
 | File | Purpose |
 |------|---------|
 | `test_qwen3_30b_gptq_xpu.py` | Test script for Qwen3-30B-A3B-GPTQ-Int4 on XPU |

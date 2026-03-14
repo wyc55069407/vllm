@@ -357,7 +357,7 @@ class GPTQLinearMethod(LinearMethodBase):
         layer.g_idx = Parameter(layer.g_idx.data, requires_grad=False)
         layer.scales = Parameter(layer.scales.data, requires_grad=False)
 
-        # On XPU, skip exllama shuffle (CUDA-only) and use PyTorch fallback
+        # On XPU, skip exllama shuffle (CUDA-only) and use oneDNN INT4 GEMM
         if current_platform.is_xpu():
             if self.quant_config.desc_act:
                 layer.g_idx.data = torch.argsort(layer.g_idx).to(torch.int)
@@ -366,6 +366,12 @@ class GPTQLinearMethod(LinearMethodBase):
                     (0,), dtype=torch.int, device=layer.g_idx.device
                 )
             layer.exllama_state = ExllamaState.READY
+
+            # Convert to oneDNN u4 format for native INT4 GEMM
+            # (only when desc_act=false so groups are sequential)
+            if (self.quant_config.weight_bits == 4
+                    and not self.quant_config.desc_act):
+                self._convert_to_onednn_u4(layer, self.use_v2_format)
             return
 
         # exllama needs to shuffle the weight after the weight is loaded
@@ -379,6 +385,78 @@ class GPTQLinearMethod(LinearMethodBase):
                 )
             layer.exllama_state = ExllamaState.READY
             ops.gptq_shuffle(layer.qweight, layer.g_idx, self.quant_config.weight_bits)
+
+    @staticmethod
+    def _convert_to_onednn_u4(
+        layer: torch.nn.Module, use_v2_format: bool
+    ) -> None:
+        """Convert GPTQ packed int32 weights to oneDNN u4 format.
+
+        Requires vllm-kernel-custom with onednn_w4a16_int4 op.
+        Only works when desc_act=false (sequential K-groups).
+
+        Stores onednn_weight, onednn_scales, onednn_zp on the layer.
+        Falls back silently if vllm-kernel-custom is unavailable.
+        """
+        try:
+            import vllm_kernel_custom  # noqa: F401
+        except ImportError:
+            return  # will use dequant+F.linear fallback
+
+        qweight = layer.qweight.data   # [K/8, N] int32
+        qzeros = layer.qzeros.data     # [num_groups, N/8] int32
+        scales = layer.scales.data      # [num_groups, N] fp16
+
+        K_packed, N = qweight.shape
+        K = K_packed * 8
+        num_groups = scales.shape[0]
+        group_size = K // num_groups
+        device = qweight.device
+
+        shifts = torch.arange(0, 32, 4, dtype=torch.int32, device=device)
+
+        # Unpack qweight: [K/8, N] int32 → [K, N] uint8
+        w_unpacked = (
+            (qweight.unsqueeze(2) >> shifts.view(1, 1, -1)) & 0xF
+        ).permute(0, 2, 1).reshape(K, N).to(torch.uint8)
+
+        # Transpose to [N, K] and repack as oneDNN u4: [N, K/2] uint8
+        # oneDNN u4 ba: physical [N,K], byte[n,k//2] = val[n,2k] | val[n,2k+1]<<4
+        w_nk = w_unpacked.t().contiguous()
+        w_u4 = (w_nk[:, 0::2] & 0xF) | ((w_nk[:, 1::2] & 0xF) << 4)
+
+        # Unpack qzeros: [num_groups, N/8] int32 → [num_groups, N] uint8
+        N_packed = qzeros.shape[1]
+        z_unpacked = (
+            (qzeros.unsqueeze(2) >> shifts.view(1, 1, -1)) & 0xF
+        ).permute(0, 2, 1).reshape(num_groups, N_packed * 8)[:, :N]
+        z_unpacked = z_unpacked.to(torch.uint8)
+
+        # Adjust zero points for GPTQ v1 format
+        if not use_v2_format:
+            z_unpacked = z_unpacked + 1
+
+        # Pack zero points as oneDNN u4: [num_groups, N/2] uint8
+        z_u4 = (z_unpacked[:, 0::2] & 0xF) | (
+            (z_unpacked[:, 1::2] & 0xF) << 4
+        )
+
+        # Scales to fp32 for oneDNN: [num_groups, N]
+        scales_fp32 = scales.to(torch.float32).contiguous()
+
+        layer.onednn_weight = w_u4.contiguous()
+        layer.onednn_scales = scales_fp32
+        layer.onednn_zp = z_u4.contiguous()
+        layer.onednn_K = K
+        layer.onednn_N = N
+        layer.onednn_group_size = group_size
+
+        logger.info(
+            "GPTQ layer converted to oneDNN u4: "
+            "weight [%d, %d] u4, scales [%d, %d] fp32, "
+            "group_size=%d",
+            N, K, num_groups, N, group_size,
+        )
 
     @staticmethod
     def _gptq_dequant_4bit(
@@ -449,15 +527,42 @@ class GPTQLinearMethod(LinearMethodBase):
         reshaped_x = x.reshape(-1, x.shape[-1])
 
         if current_platform.is_xpu() and self.quant_config.weight_bits == 4:
-            # XPU fallback: dequantize + F.linear
-            w_deq = self._gptq_dequant_4bit(
-                layer.qweight,
-                layer.qzeros,
-                layer.scales,
-                layer.g_idx,
-                self.use_v2_format,
-            )
-            output = torch.nn.functional.linear(reshaped_x, w_deq)
+            if hasattr(layer, 'onednn_weight'):
+                # Native oneDNN INT4 GEMM via vllm-kernel-custom
+                M = reshaped_x.shape[0]
+                K = layer.onednn_K
+                N = layer.onednn_N
+                output = torch.empty(
+                    M, N, dtype=reshaped_x.dtype,
+                    device=reshaped_x.device,
+                )
+                dummy_bias = torch.empty(
+                    0, dtype=reshaped_x.dtype,
+                    device=reshaped_x.device,
+                )
+                torch.ops.vllm_kernel_custom.onednn_w4a16_int4(
+                    reshaped_x.contiguous(),
+                    layer.onednn_weight,
+                    layer.onednn_scales,
+                    layer.onednn_zp,
+                    dummy_bias,
+                    output,
+                    M, N, K,
+                    layer.onednn_group_size,
+                    1,  # has_zp
+                    0,  # has_bias
+                )
+            else:
+                # Fallback: dequantize + F.linear (desc_act=true or no
+                # vllm-kernel-custom)
+                w_deq = self._gptq_dequant_4bit(
+                    layer.qweight,
+                    layer.qzeros,
+                    layer.scales,
+                    layer.g_idx,
+                    self.use_v2_format,
+                )
+                output = torch.nn.functional.linear(reshaped_x, w_deq)
         else:
             # GPTQ v1 and v2 format checkpoints deals with zero points
             # differently, and require different gemm kernels.
