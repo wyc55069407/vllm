@@ -1,0 +1,299 @@
+/* oneDNN FP8 GEMM: FP16/BF16 activations x FP8_E4M3 weights
+ *
+ * Layout:
+ *   A (activations): [M, K] FP16/BF16, format_tag::ab
+ *   B (weights):     [N, K] FP8_E4M3, physical [N,K], logical [K,N] -> format_tag::ba
+ *   scale:           [N]    FP32, per-output-channel (per-N)
+ *   C (output):      [M, N] same dtype as A, format_tag::ab
+ *
+ * Per-N scale -> mask = 2 (bit-1 of logical B dims [K,N])
+ */
+
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <torch/library.h>
+
+#include <sycl/sycl.hpp>
+#include <oneapi/dnnl/dnnl.hpp>
+#include <oneapi/dnnl/dnnl_sycl.hpp>
+
+using ST = at::ScalarType;
+
+template <dnnl::memory::data_type IT>
+static void onednn_w8a16_fp8_impl(
+    void* x, void* weight, void* scales, void* bias, void* output,
+    int64_t M, int64_t K, int64_t N,
+    sycl::queue& q
+) {
+    dnnl::engine eng = dnnl::sycl_interop::make_engine(q.get_device(), q.get_context());
+    dnnl::stream s = dnnl::sycl_interop::make_stream(eng, q);
+
+    dnnl::memory::desc x_md({M, K}, IT, dnnl::memory::format_tag::ab);
+    dnnl::memory::desc w_md({K, N}, dnnl::memory::data_type::f8_e4m3,
+                            dnnl::memory::format_tag::ba);
+    dnnl::memory::desc scale_md({N}, dnnl::memory::data_type::f32,
+                                dnnl::memory::format_tag::a);
+    dnnl::memory::desc c_md({M, N}, IT, dnnl::memory::format_tag::ab);
+
+    dnnl::primitive_attr attr;
+    attr.set_scales_mask(DNNL_ARG_WEIGHTS, 2);
+    attr.set_fpmath_mode(dnnl::fpmath_mode::any, true);
+
+    dnnl::matmul::primitive_desc pd(eng, x_md, w_md, c_md, attr);
+
+    std::string impl = pd.impl_info_str();
+    if (impl.find("ref") != std::string::npos) {
+        printf("[onednn_w8a16_fp8] WARNING: slow reference impl: %s\n", impl.c_str());
+    }
+
+    dnnl::matmul prim(pd);
+
+    std::unordered_map<int, dnnl::memory> args = {
+        {DNNL_ARG_SRC,                            dnnl::memory(x_md, eng, x)},
+        {DNNL_ARG_WEIGHTS,                        dnnl::memory(w_md, eng, weight)},
+        {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, dnnl::memory(scale_md, eng, scales)},
+        {DNNL_ARG_DST,                            dnnl::memory(c_md, eng, output)},
+    };
+
+    if (bias) {
+        dnnl::memory::desc bias_md({N}, IT, dnnl::memory::format_tag::a);
+        args.insert({DNNL_ARG_BIAS, dnnl::memory(bias_md, eng, bias)});
+    }
+
+    prim.execute(s, args);
+}
+
+at::Tensor onednn_w8a16_fp8(
+    at::Tensor x, at::Tensor weight, at::Tensor scales,
+    at::Tensor bias, at::Tensor output,
+    int64_t M, int64_t N, int64_t K, int64_t has_bias
+) {
+    auto stream = at::xpu::getCurrentXPUStream();
+    auto& dpcpp_queue = stream.queue();
+
+    using DT = dnnl::memory::data_type;
+    auto dispatch = [&](auto fn) {
+        fn(x.data_ptr(), weight.data_ptr(), scales.data_ptr(),
+           has_bias ? bias.data_ptr() : nullptr,
+           output.data_ptr(), M, K, N, dpcpp_queue);
+    };
+
+    switch (x.scalar_type()) {
+        case ST::Half:
+            dispatch(onednn_w8a16_fp8_impl<DT::f16>); break;
+        case ST::BFloat16:
+            dispatch(onednn_w8a16_fp8_impl<DT::bf16>); break;
+        case ST::Float:
+            dispatch(onednn_w8a16_fp8_impl<DT::f32>); break;
+        default:
+            TORCH_CHECK(false, "onednn_w8a16_fp8: unsupported dtype, need FP16/BF16/FP32");
+    }
+
+    return output;
+}
+
+/* ============================================================
+ * Block-scaled FP8 GEMM: K-grouped, per-N quantization
+ *
+ * Layout:
+ *   A (activations): [M, K] FP16/BF16
+ *   B (weights):     [N, K] FP8_E4M3, physical [N,K], logical [K,N] -> format_tag::ba
+ *   scales:          [K/block_k, N] FP32, K-grouped + per-N
+ *   C (output):      [M, N] same dtype as A
+ *
+ * Uses set_scales v2 API: mask=3, groups={block_k, 1} on logical [K, N].
+ * This groups K into blocks of block_k while keeping per-element N scales.
+ *
+ * Note: Full 2D grouped scales (groups={block_k, block_n}) is NOT supported
+ * on BMG/Xe2 with oneDNN v3.9.1. Only K-grouped + per-N works.
+ * ============================================================ */
+
+template <dnnl::memory::data_type IT>
+static void onednn_w8a16_fp8_block_impl(
+    void* x, void* weight, void* scales, void* bias, void* output,
+    int64_t M, int64_t K, int64_t N,
+    int64_t block_k,
+    sycl::queue& q
+) {
+    dnnl::engine eng = dnnl::sycl_interop::make_engine(q.get_device(), q.get_context());
+    dnnl::stream s = dnnl::sycl_interop::make_stream(eng, q);
+
+    dnnl::memory::desc x_md({M, K}, IT, dnnl::memory::format_tag::ab);
+    dnnl::memory::desc w_md({K, N}, dnnl::memory::data_type::f8_e4m3,
+                            dnnl::memory::format_tag::ba);
+    dnnl::memory::desc c_md({M, N}, IT, dnnl::memory::format_tag::ab);
+
+    int64_t scale_k = (K + block_k - 1) / block_k;
+    dnnl::memory::desc scale_md({scale_k, N}, dnnl::memory::data_type::f32,
+                                dnnl::memory::format_tag::ab);
+
+    dnnl::primitive_attr attr;
+    // mask=3: scales vary along both K (bit 0) and N (bit 1) of logical [K, N]
+    // groups={block_k, 1}: group K in blocks, per-element along N
+    attr.set_scales(DNNL_ARG_WEIGHTS, 3,
+                    {block_k, 1}, dnnl::memory::data_type::f32);
+    attr.set_fpmath_mode(dnnl::fpmath_mode::any, true);
+
+    dnnl::matmul::primitive_desc pd(eng, x_md, w_md, c_md, attr);
+
+    std::string impl = pd.impl_info_str();
+    if (impl.find("ref") != std::string::npos) {
+        printf("[onednn_w8a16_fp8_block] WARNING: slow reference impl: %s\n", impl.c_str());
+    }
+
+    dnnl::matmul prim(pd);
+
+    std::unordered_map<int, dnnl::memory> args = {
+        {DNNL_ARG_SRC,                            dnnl::memory(x_md, eng, x)},
+        {DNNL_ARG_WEIGHTS,                        dnnl::memory(w_md, eng, weight)},
+        {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, dnnl::memory(scale_md, eng, scales)},
+        {DNNL_ARG_DST,                            dnnl::memory(c_md, eng, output)},
+    };
+
+    if (bias) {
+        dnnl::memory::desc bias_md({N}, IT, dnnl::memory::format_tag::a);
+        args.insert({DNNL_ARG_BIAS, dnnl::memory(bias_md, eng, bias)});
+    }
+
+    prim.execute(s, args);
+}
+
+at::Tensor onednn_w8a16_fp8_block(
+    at::Tensor x, at::Tensor weight, at::Tensor scales,
+    at::Tensor bias, at::Tensor output,
+    int64_t M, int64_t N, int64_t K,
+    int64_t block_k, int64_t block_n, int64_t has_bias
+) {
+    (void)block_n; // Not used — oneDNN v3.9.1 only supports per-N (not N-grouped)
+    auto stream = at::xpu::getCurrentXPUStream();
+    auto& dpcpp_queue = stream.queue();
+
+    using DT = dnnl::memory::data_type;
+    auto dispatch = [&](auto fn) {
+        fn(x.data_ptr(), weight.data_ptr(), scales.data_ptr(),
+           has_bias ? bias.data_ptr() : nullptr,
+           output.data_ptr(), M, K, N, block_k, dpcpp_queue);
+    };
+
+    switch (x.scalar_type()) {
+        case ST::Half:
+            dispatch(onednn_w8a16_fp8_block_impl<DT::f16>); break;
+        case ST::BFloat16:
+            dispatch(onednn_w8a16_fp8_block_impl<DT::bf16>); break;
+        case ST::Float:
+            dispatch(onednn_w8a16_fp8_block_impl<DT::f32>); break;
+        default:
+            TORCH_CHECK(false, "onednn_w8a16_fp8_block: unsupported dtype, need FP16/BF16/FP32");
+    }
+
+    return output;
+}
+
+/* ============================================================
+ * INT4 W4A16 GEMM: FP16/BF16 activations x UINT4 weights
+ *
+ * For GPTQ-style quantization with group-wise scaling.
+ *
+ * Layout:
+ *   A (activations): [M, K] FP16/BF16, format_tag::ab
+ *   B (weights):     [N, K] u4, physical [N,K], logical [K,N] -> format_tag::ba
+ *                    Packed as 2 values per byte (K/2 bytes per row of N)
+ *   scales:          [K/group_size, N] FP32, K-grouped + per-N
+ *   zero_points:     [K/group_size, N] u4, K-grouped + per-N (optional)
+ *   C (output):      [M, N] same dtype as A, format_tag::ab
+ *
+ * Uses set_scales v2 API: mask=3, groups={group_size, 1} on logical [K, N].
+ * Uses set_zero_points v2 API when zero points provided.
+ * ============================================================ */
+
+template <dnnl::memory::data_type IT>
+static void onednn_w4a16_int4_impl(
+    void* x, void* weight, void* scales, void* zp, void* bias, void* output,
+    int64_t M, int64_t K, int64_t N,
+    int64_t group_size, bool has_zp,
+    sycl::queue& q
+) {
+    dnnl::engine eng = dnnl::sycl_interop::make_engine(q.get_device(), q.get_context());
+    dnnl::stream s = dnnl::sycl_interop::make_stream(eng, q);
+
+    dnnl::memory::desc x_md({M, K}, IT, dnnl::memory::format_tag::ab);
+    dnnl::memory::desc w_md({K, N}, dnnl::memory::data_type::u4,
+                            dnnl::memory::format_tag::ba);
+    dnnl::memory::desc c_md({M, N}, IT, dnnl::memory::format_tag::ab);
+
+    dnnl::primitive_attr attr;
+    // Scales: K-grouped + per-N
+    attr.set_scales(DNNL_ARG_WEIGHTS, 3,
+                    {group_size, 1}, dnnl::memory::data_type::f32);
+    // Zero points: K-grouped + per-N
+    if (has_zp) {
+        attr.set_zero_points(DNNL_ARG_WEIGHTS, 3,
+                             {group_size, 1}, dnnl::memory::data_type::u4);
+    }
+    attr.set_fpmath_mode(dnnl::fpmath_mode::any, true);
+
+    dnnl::matmul::primitive_desc pd(eng, x_md, w_md, c_md, attr);
+
+    std::string impl = pd.impl_info_str();
+    if (impl.find("ref") != std::string::npos) {
+        printf("[onednn_w4a16_int4] WARNING: slow reference impl: %s\n", impl.c_str());
+    }
+
+    dnnl::matmul prim(pd);
+
+    int64_t scale_k = (K + group_size - 1) / group_size;
+    dnnl::memory::desc scale_md({scale_k, N}, dnnl::memory::data_type::f32,
+                                dnnl::memory::format_tag::ab);
+
+    std::unordered_map<int, dnnl::memory> args = {
+        {DNNL_ARG_SRC,                            dnnl::memory(x_md, eng, x)},
+        {DNNL_ARG_WEIGHTS,                        dnnl::memory(w_md, eng, weight)},
+        {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, dnnl::memory(scale_md, eng, scales)},
+        {DNNL_ARG_DST,                            dnnl::memory(c_md, eng, output)},
+    };
+
+    if (has_zp) {
+        dnnl::memory::desc zp_md({scale_k, N}, dnnl::memory::data_type::u4,
+                                 dnnl::memory::format_tag::ab);
+        args.insert({DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_WEIGHTS,
+                     dnnl::memory(zp_md, eng, zp)});
+    }
+
+    if (bias) {
+        dnnl::memory::desc bias_md({N}, IT, dnnl::memory::format_tag::a);
+        args.insert({DNNL_ARG_BIAS, dnnl::memory(bias_md, eng, bias)});
+    }
+
+    prim.execute(s, args);
+}
+
+at::Tensor onednn_w4a16_int4(
+    at::Tensor x, at::Tensor weight, at::Tensor scales,
+    at::Tensor zp, at::Tensor bias, at::Tensor output,
+    int64_t M, int64_t N, int64_t K,
+    int64_t group_size, int64_t has_zp, int64_t has_bias
+) {
+    auto stream = at::xpu::getCurrentXPUStream();
+    auto& dpcpp_queue = stream.queue();
+
+    using DT = dnnl::memory::data_type;
+    auto dispatch = [&](auto fn) {
+        fn(x.data_ptr(), weight.data_ptr(), scales.data_ptr(),
+           has_zp ? zp.data_ptr() : nullptr,
+           has_bias ? bias.data_ptr() : nullptr,
+           output.data_ptr(), M, K, N, group_size, has_zp != 0, dpcpp_queue);
+    };
+
+    switch (x.scalar_type()) {
+        case ST::Half:
+            dispatch(onednn_w4a16_int4_impl<DT::f16>); break;
+        case ST::BFloat16:
+            dispatch(onednn_w4a16_int4_impl<DT::bf16>); break;
+        case ST::Float:
+            dispatch(onednn_w4a16_int4_impl<DT::f32>); break;
+        default:
+            TORCH_CHECK(false, "onednn_w4a16_int4: unsupported dtype, need FP16/BF16/FP32");
+    }
+
+    return output;
+}

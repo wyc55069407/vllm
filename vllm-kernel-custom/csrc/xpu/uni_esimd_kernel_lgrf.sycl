@@ -1,0 +1,401 @@
+#include <ATen/ATen.h>
+#include <ATen/Parallel.h>
+#include <c10/xpu/XPUStream.h>
+#include <torch/python.h>
+
+#include <cmath>
+#include <cstdint>
+#include <iostream>
+#include <sycl/sycl.hpp>
+#include <vector>
+
+#include "SYCLHelpers.h"
+#include "esimd_kernels/sdpa_gemm.h"
+
+/* Full attention SDP kernel headers — non-causal Flash Attention */
+#ifndef FP32_MIN
+#define FP32_MIN (-3.402823466e+38f)
+#endif
+
+using namespace sycl::ext::intel::experimental::esimd;
+
+#include "esimd_kernels/flash.attn.b.mha128.fp16.opt.h"
+#include "esimd_kernels/flash.attn.b.mha128.bf16.h"
+#include "esimd_kernels/flash.attn.b.mha128.bf16io.h"
+
+ESIMD_INLINE void esimd_mul_impl(uint8_t* a, uint8_t* b, uint8_t* c, int64_t len, nd_item<1>& ndi) {
+
+  __ESIMD_NS::slm_init(16 * sizeof(fp16)); 
+
+  int global_idx = ndi.get_group(0);
+  int local_range = ndi.get_local_range(0);
+  int local_idx = ndi.get_local_id(0);
+  int inputOffset = (global_idx * local_range + local_idx) * 128 * sizeof(fp16);
+  simd<fp16, 128> a_fp16;
+  simd<fp16, 128> b_fp16;
+  simd<fp16, 128> c_fp16;
+
+
+      a_fp16.template bit_cast_view<uint8_t>().template select<256, 1>(0) =
+              __ESIMD_ENS::lsc_block_load<
+              uint8_t,
+              256,
+              __ESIMD_ENS::lsc_data_size::default_size,
+              __ESIMD_ENS::cache_hint::cached,
+              __ESIMD_ENS::cache_hint::cached>((uint8_t*)a + inputOffset);
+
+      b_fp16.template bit_cast_view<uint8_t>().template select<256, 1>(0) =
+              __ESIMD_ENS::lsc_block_load<
+              uint8_t,
+              256,
+              __ESIMD_ENS::lsc_data_size::default_size,
+              __ESIMD_ENS::cache_hint::cached,
+              __ESIMD_ENS::cache_hint::cached>((uint8_t*)b + inputOffset);
+
+      c_fp16 = a_fp16 * b_fp16;
+
+    // if (local_idx < 16)
+    {
+      __ESIMD_ENS::lsc_block_store<
+        fp16,
+        128,
+        __ESIMD_ENS::lsc_data_size::default_size,
+        __ESIMD_ENS::cache_hint::write_back,
+        __ESIMD_ENS::cache_hint::write_back>((fp16*)c + 128 * (global_idx * local_range + local_idx), c_fp16.select<128, 1>(0));
+    }
+    barrier();
+    
+}
+
+void esimd_mul(uint8_t* a, uint8_t* b, uint8_t* c, int64_t len, sycl::queue& q){
+    sycl::range<1> LocalRange(16); 
+    sycl::range<1> GlobalRange(len / 128);
+
+    sycl::nd_range<1> Range(GlobalRange, LocalRange);
+    printf("--- global, local: %d, %d\n", 16, len / 128);
+    sycl::event e;
+    try {
+      {
+        e = q.submit([&](handler& cgh) {
+        cgh.parallel_for(Range, [=](nd_item<1> ndi) SYCL_ESIMD_KERNEL{
+              esimd_mul_impl(a, b, c, len, ndi);
+            });
+         });
+      }
+    } catch (sycl::exception const &e) {
+      std::cout << "SYCL exception caught: " << e.what() << '\n';
+      return;
+    }
+}
+
+at::Tensor esimd_kernel_mul_lgrf(
+    at::Tensor _p0,
+    at::Tensor _p1,
+    at::Tensor _p2,
+    //at::Tensor _p3,
+    //at::Tensor _p4,
+    //at::Tensor _p5,
+    //at::Tensor _p6,
+    //at::Tensor _p7,
+    //at::Tensor _p8,
+    //at::Tensor _p9,
+
+    int64_t i0,
+    int64_t i1
+    //int64_t i2,
+    //int64_t i3,
+    //int64_t i4,
+    //int64_t i5,
+    //int64_t i6,
+    //int64_t i7,
+    //int64_t i8,
+    //int64_t i9,
+
+    //float f0,
+    //float f1,
+    //float f2,
+    //float f3,
+    //float f4
+    )
+    {
+    auto p0 = reinterpret_cast<uint8_t*>(_p0.data_ptr<at::Half>());
+    auto p1 = reinterpret_cast<uint8_t*>(_p1.data_ptr<at::Half>());
+    auto p2 = reinterpret_cast<uint8_t*>(_p2.data_ptr<at::Half>());
+    //auto p3 = reinterpret_cast<uint8_t*>(_p3.data_ptr<uint8_t>());
+    //auto p4 = reinterpret_cast<uint8_t*>(_p4.data_ptr<uint8_t>());
+    //auto p5 = reinterpret_cast<uint8_t*>(_p5.data_ptr<uint8_t>());
+    //auto p6 = reinterpret_cast<uint8_t*>(_p6.data_ptr<uint8_t>());
+    //auto p7 = reinterpret_cast<uint8_t*>(_p7.data_ptr<uint8_t>());
+    //auto p8 = reinterpret_cast<uint8_t*>(_p8.data_ptr<uint8_t>());
+    //auto p9 = reinterpret_cast<uint8_t*>(_p9.data_ptr<uint8_t>());
+    auto stream = at::xpu::getCurrentXPUStream();
+    auto dpcpp_queue = stream.queue();
+
+      switch(i0){
+        case 1000:   // rms norm
+          esimd_mul(p0, p1, p2, i1, dpcpp_queue);
+          break;
+        default:
+          printf("---------- esimd uni-lgrf kernel op not supported, op is %lld ----------\n", i0);
+          break;
+      }
+      return _p2;
+    }
+
+//template <uint32_t QK_DIM, uint32_t V_DIM>
+bool runSdpFusion_mla(
+      queue& q,
+      uint8_t* q_extend,
+      uint8_t* k_extend,
+      uint8_t* v_extend,
+      uint8_t* o_extend,
+      uint8_t* k_buffer,
+      uint8_t* v_buffer,
+      uint8_t* kv_indices,
+      unsigned num_heads,
+      unsigned num_heads_kv,
+      unsigned extend_seq_len,
+      unsigned prefix_seq_len,
+      unsigned qk_dim,
+      unsigned v_dim,
+      float attn_scale)
+  {
+
+  int qhead_div_kvhead = num_heads / num_heads_kv;
+
+  int q_reduce_num = (extend_seq_len + (8 * SDP_THREAD - 1)) / (8 * SDP_THREAD);
+  //printf("q_reduce_num %d num_heads %d,  qk_dim %d , v_dim %d !!\n", q_reduce_num, num_heads, qk_dim, v_dim);
+
+  sycl::range<3> GlobalRange(num_heads / qhead_div_kvhead, qhead_div_kvhead, q_reduce_num * SDP_THREAD); // num_head x kv_len, batch size
+  sycl::range<3> LocalRange(1, 1, SDP_THREAD); // kv_len, x
+  sycl::nd_range<3> Range(GlobalRange, LocalRange);
+
+  sycl::event e;
+  try {
+          e = q.submit([&](handler& cgh) {
+          cgh.parallel_for<class mla_gemm_esimd>(Range, [=](nd_item<3> ndi) SYCL_ESIMD_KERNEL{
+              SDP_xmx_gemm(q_extend, k_extend, v_extend, o_extend, k_buffer, v_buffer, kv_indices, num_heads, num_heads_kv,extend_seq_len, prefix_seq_len,attn_scale, ndi);
+            });
+          });
+  } catch (sycl::exception const &e) {
+    std::cout << "SYCL exception caught: " << e.what() << '\n';
+    return false;
+  }
+
+  bool success = true;
+  return success;
+}
+
+void esimd_kernel_sdp_mla(
+      uint8_t* q_extend,
+      uint8_t* k_extend,
+      uint8_t* v_extend,
+      uint8_t* k_buffer,
+      uint8_t* v_buffer,
+      //uint8_t* qo_indptr,
+      //uint8_t* kv_indptr,
+      uint8_t* kv_indices, //for 1 batch 
+      uint8_t* o_extend,
+      int64_t num_heads,
+      int64_t num_heads_kv,
+      int64_t extend_seq_len,
+      int64_t prefix_seq_len,
+      //int64_t batch_idx,
+      int64_t qk_dim,
+      int64_t v_dim,
+      float attn_scale,
+
+  sycl::queue& dpcpp_queue)
+  {
+    runSdpFusion_mla(dpcpp_queue, q_extend, k_extend, v_extend, o_extend, k_buffer, v_buffer, kv_indices, num_heads, num_heads_kv,extend_seq_len, prefix_seq_len,qk_dim,v_dim ,attn_scale );
+  }
+
+at::Tensor esimd_kernel_uni_lgrf(
+    at::Tensor _p0,
+    at::Tensor _p1,
+    at::Tensor _p2,
+    at::Tensor _p3,
+    at::Tensor _p4,
+    at::Tensor _p5,
+    at::Tensor _p6,
+    at::Tensor _p7,
+    at::Tensor _p8,
+    at::Tensor _p9,
+
+    int64_t i0,
+    int64_t i1,
+    int64_t i2,
+    int64_t i3,
+    int64_t i4,
+    int64_t i5,
+    int64_t i6,
+    int64_t i7,
+    int64_t i8,
+    int64_t i9,
+
+    double f0,
+    double f1,
+    double f2,
+    double f3,
+    double f4
+    )
+    {
+    auto p0 = reinterpret_cast<uint8_t*>(_p0.data_ptr());
+    auto p1 = reinterpret_cast<uint8_t*>(_p1.data_ptr());
+    auto p2 = reinterpret_cast<uint8_t*>(_p2.data_ptr());
+    auto p3 = reinterpret_cast<uint8_t*>(_p3.data_ptr());
+    auto p4 = reinterpret_cast<uint8_t*>(_p4.data_ptr());
+    auto p5 = reinterpret_cast<uint8_t*>(_p5.data_ptr());
+    auto p6 = reinterpret_cast<uint8_t*>(_p6.data_ptr());
+    auto p7 = reinterpret_cast<uint8_t*>(_p7.data_ptr());
+    auto p8 = reinterpret_cast<uint8_t*>(_p8.data_ptr());
+    auto p9 = reinterpret_cast<uint8_t*>(_p9.data_ptr());
+    auto stream = at::xpu::getCurrentXPUStream();
+    auto dpcpp_queue = stream.queue();
+
+      switch(i0){
+        case 1006:   // sdp for MLA
+          esimd_kernel_sdp_mla(p0, p1, p2, p3, p4, p5, p6, i1, i2, i3, i4, i5, i6, f0, dpcpp_queue);
+        break;
+        default:
+          printf("---------- esimd kernel op not supported, op is %lld ----------\n", i0);
+        break;
+      }
+      return _p9;
+    }
+/* Named wrapper for SDP MLA LGRF */
+at::Tensor esimd_sdp_mla_lgrf(
+    at::Tensor q_extend, at::Tensor k_extend, at::Tensor v_extend,
+    at::Tensor k_buffer, at::Tensor v_buffer,
+    at::Tensor kv_indices, at::Tensor o_extend,
+    int64_t num_heads, int64_t num_heads_kv,
+    int64_t extend_seq_len, int64_t prefix_seq_len,
+    int64_t qk_dim, int64_t v_dim,
+    double attn_scale) {
+    auto p0 = reinterpret_cast<uint8_t*>(q_extend.data_ptr());
+    auto p1 = reinterpret_cast<uint8_t*>(k_extend.data_ptr());
+    auto p2 = reinterpret_cast<uint8_t*>(v_extend.data_ptr());
+    auto p3 = reinterpret_cast<uint8_t*>(k_buffer.data_ptr());
+    auto p4 = reinterpret_cast<uint8_t*>(v_buffer.data_ptr());
+    auto p5 = reinterpret_cast<uint8_t*>(kv_indices.data_ptr());
+    auto p6 = reinterpret_cast<uint8_t*>(o_extend.data_ptr());
+    auto stream = at::xpu::getCurrentXPUStream();
+    auto& dpcpp_queue = stream.queue();
+    esimd_kernel_sdp_mla(p0, p1, p2, p3, p4, p5, p6,
+        num_heads, num_heads_kv, extend_seq_len, prefix_seq_len,
+        qk_dim, v_dim, attn_scale, dpcpp_queue);
+    return o_extend;
+}
+
+/* ============================================================
+ * Full Attention SDP — FP16, BF16, BF16io (non-causal)
+ * Input: [B=1, L, H, 128] contiguous → squeeze(0) → [L, H, 128]
+ * normAlpha: float[H * 128], all 1.0 for standard attention
+ * ============================================================ */
+
+static void sdp_fp16_kernel(
+    sycl::queue& q,
+    uint8_t* qState, uint8_t* kState, uint8_t* vState,
+    uint8_t* normAlpha, uint8_t* out,
+    uint32_t q_len, uint32_t kv_len,
+    uint32_t headQ, uint32_t headKv)
+{
+    uint32_t q_blocks = (q_len + 255) / 256;
+    sycl::range<2> GlobalRange(headQ * 16, q_blocks);
+    sycl::range<2> LocalRange(16, 1);
+    sycl::nd_range<2> Range(GlobalRange, LocalRange);
+
+    q.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(Range, [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
+            flashAttnBMha128Fp16OptPrecomputed(
+                qState, kState, vState, normAlpha, out,
+                q_len, kv_len, headQ, headKv, ndi);
+        });
+    });
+}
+
+static void sdp_bf16_kernel(
+    sycl::queue& q,
+    uint8_t* qState, uint8_t* kState, uint8_t* vState,
+    uint8_t* normAlpha, uint8_t* out,
+    uint32_t q_len, uint32_t kv_len,
+    uint32_t headQ, uint32_t headKv)
+{
+    uint32_t q_blocks = (q_len + 255) / 256;
+    sycl::range<2> GlobalRange(headQ * 16, q_blocks);
+    sycl::range<2> LocalRange(16, 1);
+    sycl::nd_range<2> Range(GlobalRange, LocalRange);
+
+    q.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(Range, [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
+            flashAttnBMha128Bf16Precomputed(
+                qState, kState, vState, normAlpha, out,
+                q_len, kv_len, headQ, headKv, ndi);
+        });
+    });
+}
+
+static void sdp_bf16io_kernel(
+    sycl::queue& q,
+    uint8_t* qState, uint8_t* kState, uint8_t* vState,
+    uint8_t* normAlpha, uint8_t* out,
+    uint32_t q_len, uint32_t kv_len,
+    uint32_t headQ, uint32_t headKv)
+{
+    uint32_t q_blocks = (q_len + 255) / 256;
+    sycl::range<2> GlobalRange(headQ * 16, q_blocks);
+    sycl::range<2> LocalRange(16, 1);
+    sycl::nd_range<2> Range(GlobalRange, LocalRange);
+
+    q.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(Range, [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
+            flashAttnBMha128Bf16IoPrecomputed(
+                qState, kState, vState, normAlpha, out,
+                q_len, kv_len, headQ, headKv, ndi);
+        });
+    });
+}
+
+/* Named torch wrappers for SDP full attention.
+ * Input convention: [B=1, L, H, D] → squeeze dim-0 to [L, H, D].
+ * normAlpha is created internally (all 1.0).
+ * Returns output in same [B=1, L, H, D] layout.
+ */
+at::Tensor esimd_sdp_fp16(
+    at::Tensor Q, at::Tensor K, at::Tensor V, at::Tensor norm_alpha, at::Tensor output,
+    int64_t q_len, int64_t kv_len, int64_t head_q, int64_t head_kv)
+{
+    auto stream = at::xpu::getCurrentXPUStream();
+    auto& dpcpp_queue = stream.queue();
+    sdp_fp16_kernel(dpcpp_queue,
+        (uint8_t*)Q.data_ptr(), (uint8_t*)K.data_ptr(), (uint8_t*)V.data_ptr(),
+        (uint8_t*)norm_alpha.data_ptr(), (uint8_t*)output.data_ptr(),
+        (uint32_t)q_len, (uint32_t)kv_len, (uint32_t)head_q, (uint32_t)head_kv);
+    return output;
+}
+
+at::Tensor esimd_sdp_bf16(
+    at::Tensor Q, at::Tensor K, at::Tensor V, at::Tensor norm_alpha, at::Tensor output,
+    int64_t q_len, int64_t kv_len, int64_t head_q, int64_t head_kv)
+{
+    auto stream = at::xpu::getCurrentXPUStream();
+    auto& dpcpp_queue = stream.queue();
+    sdp_bf16_kernel(dpcpp_queue,
+        (uint8_t*)Q.data_ptr(), (uint8_t*)K.data_ptr(), (uint8_t*)V.data_ptr(),
+        (uint8_t*)norm_alpha.data_ptr(), (uint8_t*)output.data_ptr(),
+        (uint32_t)q_len, (uint32_t)kv_len, (uint32_t)head_q, (uint32_t)head_kv);
+    return output;
+}
+
+at::Tensor esimd_sdp_bf16io(
+    at::Tensor Q, at::Tensor K, at::Tensor V, at::Tensor norm_alpha, at::Tensor output,
+    int64_t q_len, int64_t kv_len, int64_t head_q, int64_t head_kv)
+{
+    auto stream = at::xpu::getCurrentXPUStream();
+    auto& dpcpp_queue = stream.queue();
+    sdp_bf16io_kernel(dpcpp_queue,
+        (uint8_t*)Q.data_ptr(), (uint8_t*)K.data_ptr(), (uint8_t*)V.data_ptr(),
+        (uint8_t*)norm_alpha.data_ptr(), (uint8_t*)output.data_ptr(),
+        (uint32_t)q_len, (uint32_t)kv_len, (uint32_t)head_q, (uint32_t)head_kv);
+    return output;
+}
