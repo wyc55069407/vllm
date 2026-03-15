@@ -576,6 +576,30 @@ ESIMD_INLINE void sdp_paged_prefill_dpas(
     int32_t kvOuterLoops = (max_kv_end + PF_KV_CHUNK - 1) / PF_KV_CHUNK;
     if (kvOuterLoops <= 0) kvOuterLoops = 1;
 
+    // Pre-compute causal boundaries for Q tokens in this subgroup's Q-pairs
+    // causal_bound[qr] = max valid KV position for Q token at (sg_j*32 + qp*16 + qr)
+    // If q_local >= actual_q_rows, set to -1 (mask everything for invalid Q)
+    simd<int32_t, 16> causal_bound_0, causal_bound_1;
+    {
+        simd<int32_t, 16> q_idx_vec;
+        #pragma unroll
+        for (int qr = 0; qr < 16; qr++) q_idx_vec[qr] = qr;
+
+        simd<int32_t, 16> q_local_0 = sg_j * 32 + q_idx_vec;
+        simd<int32_t, 16> q_local_1 = sg_j * 32 + 16 + q_idx_vec;
+
+        if (causal) {
+            causal_bound_0 = q_abs_base + q_local_0;
+            causal_bound_1 = q_abs_base + q_local_1;
+        } else {
+            causal_bound_0 = seq_len - 1;
+            causal_bound_1 = seq_len - 1;
+        }
+        // Invalid Q rows: set boundary to -1 so all KV positions are masked
+        causal_bound_0.merge(-1, q_local_0 >= actual_q_rows);
+        causal_bound_1.merge(-1, q_local_1 >= actual_q_rows);
+    }
+
     // Persistent K payload for paged block loads
     __ESIMD_ENS::config_2d_mem_access<fp16, 16, 16, 1> payloadK(
         (fp16*)kv_cache_ptr, kv_surf_w, kv_surf_h, kv_surf_w, kv_x_k, 0);
@@ -633,6 +657,21 @@ ESIMD_INLINE void sdp_paged_prefill_dpas(
         }
     }
 
+    // Pre-compute the first outer iteration that needs masking.
+    // For iterations before this, no KV position exceeds any causal boundary,
+    // so masking is a no-op — skip it entirely for speed.
+    int32_t min_bound = causal_bound_0[0];
+    #pragma unroll
+    for (int i = 1; i < 16; i++) {
+        min_bound = (causal_bound_0[i] < min_bound) ? causal_bound_0[i] : min_bound;
+        min_bound = (causal_bound_1[i] < min_bound) ? causal_bound_1[i] : min_bound;
+    }
+    // Account for this sg_i's KV offset within the chunk
+    int32_t sg_kv_max_in_chunk = sg_i * PF_KV_PER_SG + PF_KV_PER_SG - 1;
+    int32_t firstMaskIter = (min_bound - sg_kv_max_in_chunk) / (int32_t)PF_KV_CHUNK;
+    if (firstMaskIter < 0) firstMaskIter = 0;
+    if (firstMaskIter > kvOuterLoops) firstMaskIter = kvOuterLoops;
+
     // ============================================================
     // OUTER KV LOOP — ST_tile has QK[outerIter] scores on entry
     // ============================================================
@@ -644,52 +683,15 @@ ESIMD_INLINE void sdp_paged_prefill_dpas(
         // ========================================
         ST_tile *= attnScoreMul;
 
-        if (outerIter == kvOuterLoops - 1) {
-            uint32_t kv_base_sg = kv_start + sg_i * PF_KV_PER_SG;
+        // Apply masks only when needed (causal + boundary + invalid-Q)
+        if (outerIter >= firstMaskIter) {
+            int32_t kv_base_sg = kv_start + sg_i * PF_KV_PER_SG;
             #pragma unroll
-            for (int qp = 0; qp < (int)PF_Q_PAIRS; qp++) {
-                #pragma unroll
-                for (int kv = 0; kv < 8; kv++) {
-                    if (kv_base_sg + kv >= (uint32_t)max_kv_end)
-                        ST_tile.select<16, 1>(qp * 256 + kv * 16) = FP32_MIN;
-                    if (kv_base_sg + 8 + kv >= (uint32_t)max_kv_end)
-                        ST_tile.select<16, 1>(qp * 256 + 128 + kv * 16) = FP32_MIN;
-                }
-            }
-        }
-
-        if (causal) {
-            #pragma unroll
-            for (int qp = 0; qp < (int)PF_Q_PAIRS; qp++) {
-                #pragma unroll
-                for (int qr = 0; qr < 16; qr++) {
-                    int q_local = sg_j * 32 + qp * 16 + qr;
-                    int q_abs = q_abs_base + q_local;
-                    int kv_end_for_q = q_abs + 1;
-
-                    uint32_t kv_base_sg = kv_start + sg_i * PF_KV_PER_SG;
-                    #pragma unroll
-                    for (int kv = 0; kv < 8; kv++) {
-                        if ((int)(kv_base_sg + kv) >= kv_end_for_q)
-                            ST_tile[qp * 256 + kv * 16 + qr] = FP32_MIN;
-                        if ((int)(kv_base_sg + 8 + kv) >= kv_end_for_q)
-                            ST_tile[qp * 256 + 128 + kv * 16 + qr] = FP32_MIN;
-                    }
-                }
-            }
-        }
-
-        #pragma unroll
-        for (int qp = 0; qp < (int)PF_Q_PAIRS; qp++) {
-            #pragma unroll
-            for (int qr = 0; qr < 16; qr++) {
-                int q_local = sg_j * 32 + qp * 16 + qr;
-                if (q_local >= actual_q_rows) {
-                    #pragma unroll
-                    for (int kv = 0; kv < 16; kv++) {
-                        ST_tile[qp * 256 + kv * 16 + qr] = FP32_MIN;
-                    }
-                }
+            for (int kv = 0; kv < 16; kv++) {
+                int32_t kv_pos = kv_base_sg + kv;
+                simd<int32_t, 16> v_kv_pos(kv_pos);
+                ST_tile.select<16, 1>(0 * 256 + kv * 16).merge(FP32_MIN, v_kv_pos > causal_bound_0);
+                ST_tile.select<16, 1>(1 * 256 + kv * 16).merge(FP32_MIN, v_kv_pos > causal_bound_1);
             }
         }
 
