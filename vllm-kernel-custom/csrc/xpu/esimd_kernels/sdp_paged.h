@@ -1,10 +1,11 @@
 /* sdp_paged.h — Optimized paged SDP kernels (HD=256, bf16io).
  *
- * Four kernels:
- *   1. sdp_paged_kernel_scalar    — Scalar fallback for decode/prefill (all HD)
- *   2. sdp_paged_decode_phase1    — Per-chunk partial softmax for decode
- *   3. sdp_paged_decode_phase2    — Cross-chunk log-sum-exp reduction
- *   4. sdp_paged_prefill_dpas     — DPAS-based prefill (HD=256, 32-thread WG)
+ * Five kernels:
+ *   1. sdp_paged_kernel_scalar      — Scalar fallback for decode/prefill (all HD)
+ *   2. sdp_paged_decode_phase1      — Per-chunk partial softmax for decode (legacy)
+ *   3. sdp_paged_decode_phase2      — Cross-chunk log-sum-exp reduction
+ *   4. sdp_paged_decode_gqa_phase1  — GQA-optimized decode: Q_HEAD_PER_T=4, K/V shared
+ *   5. sdp_paged_prefill_dpas       — DPAS-based prefill (HD=256, 32-thread WG)
  *
  * KV cache layout: [2, num_blocks, block_size, num_kv_heads, head_dim] bf16 (NHD).
  *   kv_cache[0] = key cache, kv_cache[1] = value cache.
@@ -24,6 +25,8 @@ using bf16 = sycl::ext::oneapi::bfloat16;
  * ============================================================ */
 static constexpr int DEC_CHUNK_SIZE = 128;  // KV tokens per chunk in phase1
 static constexpr int DEC_SCRATCH_PER_CHUNK = 528;  // bytes: 4+4+512 padded to 16B
+static constexpr int DEC_GQA_GROUP_SIZE = 4;   // Q heads per KV head (Qwen3.5-4B: 16Q/4KV)
+static constexpr int DEC_GQA_CHUNK_SIZE = 64;  // KV tokens per chunk (tunable: 32/64/128)
 
 /* ============================================================
  * ESIMD scalar math helpers
@@ -363,7 +366,13 @@ ESIMD_INLINE void sdp_paged_decode_phase2(
     const int seq_len = seq_lens_ptr[req_idx];
     if (seq_len <= 0) return;
 
-    int actual_chunks = (seq_len + DEC_CHUNK_SIZE - 1) / DEC_CHUNK_SIZE;
+    // Use num_chunks_per_seq from launcher (matches GQA chunk size)
+    int actual_chunks = num_chunks_per_seq;
+    // But clamp to actual sequence length
+    {
+        int seq_chunks = (seq_len + DEC_GQA_CHUNK_SIZE - 1) / DEC_GQA_CHUNK_SIZE;
+        if (seq_chunks < actual_chunks) actual_chunks = seq_chunks;
+    }
 
     int base_scratch_idx = (req_idx * num_heads + head_idx) * num_chunks_per_seq;
 
@@ -422,6 +431,173 @@ ESIMD_INLINE void sdp_paged_decode_phase2(
 
 
 /* ============================================================
+ * GQA-OPTIMIZED DECODE PHASE 1 — Single-thread, online softmax
+ *
+ * One thread per (request, kv_head, chunk).
+ * Each thread processes DEC_GQA_CHUNK_SIZE KV tokens for 4 Q heads.
+ * K/V loaded once, dot product computed for all 4 Q heads → 4× BW savings.
+ * Online softmax: single pass loads K+V together.
+ * ============================================================ */
+ESIMD_INLINE void sdp_paged_decode_gqa_phase1(
+    const unsigned short* __restrict__ query_ptr,
+    const unsigned short* __restrict__ kv_cache_ptr,
+    float* __restrict__ scratch_ptr,
+    const int* __restrict__ block_table_ptr,
+    const int* __restrict__ seq_lens_ptr,
+    int num_heads, int num_kv_heads, int head_dim,
+    int block_size, int max_blocks_per_seq,
+    int64_t kv_stride_split, int64_t kv_stride_block,
+    int64_t kv_stride_pos, int64_t kv_stride_head,
+    float attn_scale,
+    int num_chunks_per_seq,
+    nd_item<1>& ndi)
+{
+    constexpr int QHT = DEC_GQA_GROUP_SIZE;    // 4
+    constexpr int HD  = 256;
+
+    int tid = ndi.get_global_id(0);
+
+    int chunk_id = tid % num_chunks_per_seq;
+    int temp = tid / num_chunks_per_seq;
+    int kv_head_idx = temp % num_kv_heads;
+    int req_idx = temp / num_kv_heads;
+
+    int group_size = num_heads / num_kv_heads;
+    int q_head_start = kv_head_idx * group_size;
+    int seq_len = seq_lens_ptr[req_idx];
+
+    // This thread's KV range
+    int kv_start = chunk_id * DEC_GQA_CHUNK_SIZE;
+    int kv_end = kv_start + DEC_GQA_CHUNK_SIZE;
+    if (kv_end > seq_len) kv_end = seq_len;
+    if (kv_start >= seq_len) kv_end = kv_start;
+
+    int64_t kv_head_offset = (int64_t)kv_head_idx * kv_stride_head;
+    const int* block_table_row = block_table_ptr + (int64_t)req_idx * max_blocks_per_seq;
+
+    // Load Q for all 4 heads (scaled)
+    const unsigned short* q_base = query_ptr +
+        (int64_t)req_idx * num_heads * head_dim;
+
+    simd<float, 64> q0_a = sdp_load_bf16_64(q_base + (q_head_start + 0) * head_dim) * attn_scale;
+    simd<float, 64> q0_b = sdp_load_bf16_64(q_base + (q_head_start + 0) * head_dim + 64) * attn_scale;
+    simd<float, 64> q0_c = sdp_load_bf16_64(q_base + (q_head_start + 0) * head_dim + 128) * attn_scale;
+    simd<float, 64> q0_d = sdp_load_bf16_64(q_base + (q_head_start + 0) * head_dim + 192) * attn_scale;
+
+    simd<float, 64> q1_a = sdp_load_bf16_64(q_base + (q_head_start + 1) * head_dim) * attn_scale;
+    simd<float, 64> q1_b = sdp_load_bf16_64(q_base + (q_head_start + 1) * head_dim + 64) * attn_scale;
+    simd<float, 64> q1_c = sdp_load_bf16_64(q_base + (q_head_start + 1) * head_dim + 128) * attn_scale;
+    simd<float, 64> q1_d = sdp_load_bf16_64(q_base + (q_head_start + 1) * head_dim + 192) * attn_scale;
+
+    simd<float, 64> q2_a = sdp_load_bf16_64(q_base + (q_head_start + 2) * head_dim) * attn_scale;
+    simd<float, 64> q2_b = sdp_load_bf16_64(q_base + (q_head_start + 2) * head_dim + 64) * attn_scale;
+    simd<float, 64> q2_c = sdp_load_bf16_64(q_base + (q_head_start + 2) * head_dim + 128) * attn_scale;
+    simd<float, 64> q2_d = sdp_load_bf16_64(q_base + (q_head_start + 2) * head_dim + 192) * attn_scale;
+
+    simd<float, 64> q3_a = sdp_load_bf16_64(q_base + (q_head_start + 3) * head_dim) * attn_scale;
+    simd<float, 64> q3_b = sdp_load_bf16_64(q_base + (q_head_start + 3) * head_dim + 64) * attn_scale;
+    simd<float, 64> q3_c = sdp_load_bf16_64(q_base + (q_head_start + 3) * head_dim + 128) * attn_scale;
+    simd<float, 64> q3_d = sdp_load_bf16_64(q_base + (q_head_start + 3) * head_dim + 192) * attn_scale;
+
+    // Online softmax state for 4 heads
+    float mx0 = FP32_MIN, mx1 = FP32_MIN, mx2 = FP32_MIN, mx3 = FP32_MIN;
+    float lse0 = 0, lse1 = 0, lse2 = 0, lse3 = 0;
+    simd<float, 64> a0_a(0), a0_b(0), a0_c(0), a0_d(0);
+    simd<float, 64> a1_a(0), a1_b(0), a1_c(0), a1_d(0);
+    simd<float, 64> a2_a(0), a2_b(0), a2_c(0), a2_d(0);
+    simd<float, 64> a3_a(0), a3_b(0), a3_c(0), a3_d(0);
+
+    for (int kv_pos = kv_start; kv_pos < kv_end; kv_pos++) {
+        int blk_idx = kv_pos / block_size;
+        int blk_off = kv_pos & (block_size - 1);
+        int blk_num = block_table_row[blk_idx];
+
+        int64_t kv_base_off = (int64_t)blk_num * kv_stride_block +
+                              (int64_t)blk_off * kv_stride_pos + kv_head_offset;
+
+        // Load K
+        const unsigned short* k_ptr = kv_cache_ptr + kv_base_off;
+        simd<float, 64> k_a = sdp_load_bf16_64(k_ptr);
+        simd<float, 64> k_b = sdp_load_bf16_64(k_ptr + 64);
+        simd<float, 64> k_c = sdp_load_bf16_64(k_ptr + 128);
+        simd<float, 64> k_d = sdp_load_bf16_64(k_ptr + 192);
+
+        // QK dot products (scale already in Q)
+        float s0 = sdp_dot256(q0_a, q0_b, q0_c, q0_d, k_a, k_b, k_c, k_d);
+        float s1 = sdp_dot256(q1_a, q1_b, q1_c, q1_d, k_a, k_b, k_c, k_d);
+        float s2 = sdp_dot256(q2_a, q2_b, q2_c, q2_d, k_a, k_b, k_c, k_d);
+        float s3 = sdp_dot256(q3_a, q3_b, q3_c, q3_d, k_a, k_b, k_c, k_d);
+
+        // Load V
+        const unsigned short* v_ptr = kv_cache_ptr + kv_base_off + kv_stride_split;
+        simd<float, 64> v_a = sdp_load_bf16_64(v_ptr);
+        simd<float, 64> v_b = sdp_load_bf16_64(v_ptr + 64);
+        simd<float, 64> v_c = sdp_load_bf16_64(v_ptr + 128);
+        simd<float, 64> v_d = sdp_load_bf16_64(v_ptr + 192);
+
+        // Online softmax + V accumulation for each head
+        // Head 0
+        float old_mx0 = mx0;
+        if (s0 > mx0) mx0 = s0;
+        float corr0 = sdp_esimd_expf(old_mx0 - mx0);
+        float w0 = sdp_esimd_expf(s0 - mx0);
+        a0_a = a0_a * corr0 + v_a * w0; a0_b = a0_b * corr0 + v_b * w0;
+        a0_c = a0_c * corr0 + v_c * w0; a0_d = a0_d * corr0 + v_d * w0;
+        lse0 = lse0 * corr0 + w0;
+
+        // Head 1
+        float old_mx1 = mx1;
+        if (s1 > mx1) mx1 = s1;
+        float corr1 = sdp_esimd_expf(old_mx1 - mx1);
+        float w1 = sdp_esimd_expf(s1 - mx1);
+        a1_a = a1_a * corr1 + v_a * w1; a1_b = a1_b * corr1 + v_b * w1;
+        a1_c = a1_c * corr1 + v_c * w1; a1_d = a1_d * corr1 + v_d * w1;
+        lse1 = lse1 * corr1 + w1;
+
+        // Head 2
+        float old_mx2 = mx2;
+        if (s2 > mx2) mx2 = s2;
+        float corr2 = sdp_esimd_expf(old_mx2 - mx2);
+        float w2 = sdp_esimd_expf(s2 - mx2);
+        a2_a = a2_a * corr2 + v_a * w2; a2_b = a2_b * corr2 + v_b * w2;
+        a2_c = a2_c * corr2 + v_c * w2; a2_d = a2_d * corr2 + v_d * w2;
+        lse2 = lse2 * corr2 + w2;
+
+        // Head 3
+        float old_mx3 = mx3;
+        if (s3 > mx3) mx3 = s3;
+        float corr3 = sdp_esimd_expf(old_mx3 - mx3);
+        float w3 = sdp_esimd_expf(s3 - mx3);
+        a3_a = a3_a * corr3 + v_a * w3; a3_b = a3_b * corr3 + v_b * w3;
+        a3_c = a3_c * corr3 + v_c * w3; a3_d = a3_d * corr3 + v_d * w3;
+        lse3 = lse3 * corr3 + w3;
+    }
+
+    // Write to global scratch for all 4 Q heads
+    float maxes[4] = {mx0, mx1, mx2, mx3};
+    float lses[4] = {lse0, lse1, lse2, lse3};
+
+    #pragma unroll
+    for (int h = 0; h < QHT; h++) {
+        int scratch_idx = (req_idx * num_heads + q_head_start + h) * num_chunks_per_seq + chunk_id;
+        float* scratch_base = scratch_ptr + scratch_idx * (DEC_SCRATCH_PER_CHUNK / 4);
+        scratch_base[0] = maxes[h];
+        scratch_base[1] = lses[h];
+
+        unsigned short* out_bf16 = reinterpret_cast<unsigned short*>(scratch_base + 2);
+        if (h == 0) { sdp_store_bf16_64(out_bf16, a0_a); sdp_store_bf16_64(out_bf16 + 64, a0_b);
+                      sdp_store_bf16_64(out_bf16 + 128, a0_c); sdp_store_bf16_64(out_bf16 + 192, a0_d); }
+        if (h == 1) { sdp_store_bf16_64(out_bf16, a1_a); sdp_store_bf16_64(out_bf16 + 64, a1_b);
+                      sdp_store_bf16_64(out_bf16 + 128, a1_c); sdp_store_bf16_64(out_bf16 + 192, a1_d); }
+        if (h == 2) { sdp_store_bf16_64(out_bf16, a2_a); sdp_store_bf16_64(out_bf16 + 64, a2_b);
+                      sdp_store_bf16_64(out_bf16 + 128, a2_c); sdp_store_bf16_64(out_bf16 + 192, a2_d); }
+        if (h == 3) { sdp_store_bf16_64(out_bf16, a3_a); sdp_store_bf16_64(out_bf16 + 64, a3_b);
+                      sdp_store_bf16_64(out_bf16 + 128, a3_c); sdp_store_bf16_64(out_bf16 + 192, a3_d); }
+    }
+}
+
+
+/* ============================================================
  * DPAS-BASED PREFILL KERNEL — HD=256, bf16io, 32-thread WG
  *
  * Adapted from the 88 TFLOPS S^T architecture reference kernel.
@@ -461,6 +637,7 @@ static constexpr uint32_t PF_SUM_SLM_BASE = 0x19000;  // 4 KB
 static constexpr uint32_t PF_TOTAL_SLM    = 0x1A000;  // 104 KB total
 
 
+template<bool CAUSAL>
 ESIMD_INLINE void sdp_paged_prefill_dpas(
     const unsigned short* __restrict__ query_ptr,
     const unsigned short* __restrict__ kv_cache_ptr,
@@ -473,7 +650,6 @@ ESIMD_INLINE void sdp_paged_prefill_dpas(
     int64_t kv_stride_split, int64_t kv_stride_block,
     int64_t kv_stride_pos, int64_t kv_stride_head,
     float attn_scale,
-    int causal,
     int num_tokens,
     int max_q_tiles_per_req,
     int batch,
@@ -512,19 +688,33 @@ ESIMD_INLINE void sdp_paged_prefill_dpas(
 
     int32_t group_size = num_heads / num_kv_heads;
     int32_t kv_head_idx = head_idx / group_size;
-    int64_t kv_head_offset = (int64_t)kv_head_idx * kv_stride_head;
+
+    // Convert int64 strides to uint32 derived values immediately — free int64 regs
+    uint32_t kv_head_off_u32 = (uint32_t)((int64_t)kv_head_idx * kv_stride_head);
+    uint32_t kv_row_bytes = (uint32_t)(kv_stride_pos * 2);
+    int32_t num_blocks_total = (int32_t)(kv_stride_split / kv_stride_block);
+    const unsigned short* kv_v_base = kv_cache_ptr + kv_stride_split;
+
     const int* block_table_row = block_table_ptr + (int64_t)req_idx * max_blocks_per_seq;
-    int32_t max_valid_blk_idx = (seq_len - 1) / block_size;
+    // block_size is always power of 2 — use shift for division
+    int32_t block_size_shift = __builtin_ctz(block_size);
+    int32_t block_size_mask = block_size - 1;
+    int32_t max_valid_blk_idx = (seq_len - 1) >> block_size_shift;
+
+// Experiment: bypass block table to measure overhead
+#ifdef PAGED_BYPASS_BLOCK_TABLE
+#define BLK_TABLE_LOAD(idx) (idx)
+#else
+#define BLK_TABLE_LOAD(idx) block_table_row[(idx)]
+#endif
 
     int32_t q_global_start = req_q_start + q_offset;
     int32_t q_abs_base = (seq_len - req_query_len) + q_offset;
 
-    // 2D surface parameters for per-block KV access
-    // Within a block, positions are contiguous with stride kv_stride_pos
-    uint32_t kv_row_bytes = (uint32_t)(kv_stride_pos * 2);  // bytes per KV position row
+    // 2D surface parameters — FIXED BASE for entire KV cache
     uint32_t kv_surf_w = kv_row_bytes - 1;
-    uint32_t kv_surf_h = (uint32_t)(block_size - 1);
-    uint32_t kv_x_k = (uint32_t)kv_head_offset;  // X offset for K loads (in fp16/bf16 elements)
+    uint32_t kv_surf_h = (uint32_t)((num_blocks_total << block_size_shift) - 1);
+    uint32_t kv_x_k = kv_head_off_u32;
 
     // ============================================================
     // COOPERATIVE Q LOAD TO SLM
@@ -557,7 +747,7 @@ ESIMD_INLINE void sdp_paged_prefill_dpas(
     barrier();
 
     // ============================================================
-    // REGISTER DECLARATIONS (matching reference: ST_next for pipelining)
+    // REGISTER DECLARATIONS
     // ============================================================
     simd<float, 1024> A_tile = 0;
     simd<float, 512> ST_tile;
@@ -567,7 +757,7 @@ ESIMD_INLINE void sdp_paged_prefill_dpas(
     simd<float, 32> delta;
 
     int32_t max_kv_end;
-    if (causal) {
+    if constexpr (CAUSAL) {
         max_kv_end = q_abs_base + actual_q_rows;
         if (max_kv_end > seq_len) max_kv_end = seq_len;
     } else {
@@ -576,11 +766,9 @@ ESIMD_INLINE void sdp_paged_prefill_dpas(
     int32_t kvOuterLoops = (max_kv_end + PF_KV_CHUNK - 1) / PF_KV_CHUNK;
     if (kvOuterLoops <= 0) kvOuterLoops = 1;
 
-    // Pre-compute causal boundaries for Q tokens in this subgroup's Q-pairs
-    // causal_bound[qr] = max valid KV position for Q token at (sg_j*32 + qp*16 + qr)
-    // If q_local >= actual_q_rows, set to -1 (mask everything for invalid Q)
+    // Pre-compute causal boundaries (CAUSAL only — noncausal skips entirely, saves 32 regs)
     simd<int32_t, 16> causal_bound_0, causal_bound_1;
-    {
+    if constexpr (CAUSAL) {
         simd<int32_t, 16> q_idx_vec;
         #pragma unroll
         for (int qr = 0; qr < 16; qr++) q_idx_vec[qr] = qr;
@@ -588,42 +776,80 @@ ESIMD_INLINE void sdp_paged_prefill_dpas(
         simd<int32_t, 16> q_local_0 = sg_j * 32 + q_idx_vec;
         simd<int32_t, 16> q_local_1 = sg_j * 32 + 16 + q_idx_vec;
 
-        if (causal) {
-            causal_bound_0 = q_abs_base + q_local_0;
-            causal_bound_1 = q_abs_base + q_local_1;
-        } else {
-            causal_bound_0 = seq_len - 1;
-            causal_bound_1 = seq_len - 1;
-        }
-        // Invalid Q rows: set boundary to -1 so all KV positions are masked
+        causal_bound_0 = q_abs_base + q_local_0;
+        causal_bound_1 = q_abs_base + q_local_1;
         causal_bound_0.merge(-1, q_local_0 >= actual_q_rows);
         causal_bound_1.merge(-1, q_local_1 >= actual_q_rows);
     }
 
-    // Persistent K payload for paged block loads
+    // Fixed-base payloads — configured ONCE, only set_x/set_y per iteration
     __ESIMD_ENS::config_2d_mem_access<fp16, 16, 16, 1> payloadK(
         (fp16*)kv_cache_ptr, kv_surf_w, kv_surf_h, kv_surf_w, kv_x_k, 0);
 
+    __ESIMD_ENS::config_2d_mem_access<uint32_t, 16, 8, 1> payloadKpf(
+        (uint32_t*)kv_cache_ptr, kv_surf_w, kv_surf_h, kv_surf_w, (uint32_t)(kv_x_k / 2), 0);
+
+    __ESIMD_ENS::config_2d_mem_access<fp16, 16, 16, 1> payloadV(
+        (fp16*)(kv_v_base), kv_surf_w, kv_surf_h, kv_surf_w,
+        (uint32_t)(kv_head_off_u32 + sg_i * 32), 0);
+
+    __ESIMD_ENS::config_2d_mem_access<uint32_t, 8, 16, 1> payloadVpf(
+        (uint32_t*)(kv_v_base), kv_surf_w, kv_surf_h, kv_surf_w,
+        (uint32_t)(kv_head_off_u32 / 2 + sg_i * 16), 0);
+
     // ============================================================
-    // PROLOGUE: QK[0] -> ST_tile
+    // PROLOGUE K PREFETCH: prefetch K[0] + K[1]
+    // Per-iteration block lookup: one block_table_row[] load per chunk.
     // ============================================================
     {
-        int32_t kv_pos = sg_i * PF_KV_PER_SG;
-        int32_t blk_idx = kv_pos / block_size;
-        if (blk_idx > max_valid_blk_idx) blk_idx = 0;
-        int32_t blk_off = kv_pos & (block_size - 1);
-        int32_t blk_num = block_table_row[blk_idx];
+        int32_t pf0_phys = BLK_TABLE_LOAD(0);
+        payloadKpf.set_y((uint32_t)((pf0_phys << block_size_shift) + sg_i * (int32_t)PF_KV_PER_SG));
+        #pragma unroll
+        for (int d = 0; d < (int)PF_HD_BLKS; d++) {
+            payloadKpf.set_x((uint32_t)(kv_x_k / 2 + d * 8));
+            __ESIMD_ENS::lsc_prefetch_2d<uint32_t, 16, 8, 1, false, false,
+                __ESIMD_ENS::cache_hint::cached, __ESIMD_ENS::cache_hint::cached>(payloadKpf);
+        }
+    }
+    if (kvOuterLoops > 1) {
+        int32_t pf1_logical = (int32_t)PF_KV_CHUNK >> block_size_shift;
+        int32_t pf1_off = (int32_t)PF_KV_CHUNK & block_size_mask;
+        int32_t pf1_phys = BLK_TABLE_LOAD(pf1_logical);
+        payloadKpf.set_y((uint32_t)((pf1_phys << block_size_shift) + pf1_off + sg_i * (int32_t)PF_KV_PER_SG));
+        #pragma unroll
+        for (int d = 0; d < (int)PF_HD_BLKS; d++) {
+            payloadKpf.set_x((uint32_t)(kv_x_k / 2 + d * 8));
+            __ESIMD_ENS::lsc_prefetch_2d<uint32_t, 16, 8, 1, false, false,
+                __ESIMD_ENS::cache_hint::cached, __ESIMD_ENS::cache_hint::cached>(payloadKpf);
+        }
+    }
+
+    // ============================================================
+    // PROLOGUE: QK[0] -> ST_tile, with V[0] prefetch interleaved
+    // D-loop peeled: main loop d=0..PF_HD_BLKS-2, then last D-block
+    // ============================================================
+    {
+        int32_t phys0 = BLK_TABLE_LOAD(0);
+        uint32_t Y_base_K = (uint32_t)((phys0 << block_size_shift) + sg_i * PF_KV_PER_SG);
+        uint32_t Y_base_V = (uint32_t)(phys0 << block_size_shift);
 
         ST_tile = 0;
 
-        payloadK = __ESIMD_ENS::config_2d_mem_access<fp16, 16, 16, 1>(
-            (fp16*)(kv_cache_ptr + (int64_t)blk_num * kv_stride_block),
-            kv_surf_w, kv_surf_h, kv_surf_w, kv_x_k, blk_off);
+        payloadK.set_y(Y_base_K);
         simd<fp16, 256> K_both = __ESIMD_ENS::lsc_load_2d<fp16, 16, 16, 1, false, false,
             __ESIMD_ENS::cache_hint::cached, __ESIMD_ENS::cache_hint::cached>(payloadK);
 
         #pragma unroll
-        for (int d = 0; d < (int)PF_HD_BLKS; d++) {
+        for (int d = 0; d < (int)PF_HD_BLKS - 1; d++) {
+            // V prefetch: half rate (every other D-block) — reduces memory pressure
+            if ((d & 1) == 0) {
+            payloadVpf.set_x(kv_head_off_u32 / 2 + sg_i * 16 + (d & 1) * 8);
+            payloadVpf.set_y(Y_base_V + (d >> 1) * 16);
+            __ESIMD_ENS::lsc_prefetch_2d<uint32_t, 8, 16, 1, false, false,
+                __ESIMD_ENS::cache_hint::cached,
+                __ESIMD_ENS::cache_hint::cached>(payloadVpf);
+            }
+
             simd<bf16, 128> K_sb0(K_both.select<128, 1>(0).template bit_cast_view<bf16>().data());
             simd<bf16, 128> K_sb1(K_both.select<128, 1>(128).template bit_cast_view<bf16>().data());
 
@@ -649,31 +875,52 @@ ESIMD_INLINE void sdp_paged_prefill_dpas(
             { auto acc = ST_tile.select<128, 1>(384);
               acc = dpas<8, 8, float, float, bf16, bf16>(simd<float, 128>(acc.data()), simd<bf16, 256>(Q_vnni1.data()), K_sb1); }
 
-            if (d < (int)PF_HD_BLKS - 1) {
-                payloadK.set_x(kv_x_k + (d + 1) * 16);
-                K_both = __ESIMD_ENS::lsc_load_2d<fp16, 16, 16, 1, false, false,
-                    __ESIMD_ENS::cache_hint::cached, __ESIMD_ENS::cache_hint::cached>(payloadK);
+            payloadK.set_x(kv_x_k + (d + 1) * 16);
+            K_both = __ESIMD_ENS::lsc_load_2d<fp16, 16, 16, 1, false, false,
+                __ESIMD_ENS::cache_hint::cached, __ESIMD_ENS::cache_hint::cached>(payloadK);
+        }
+
+        // Last D-block (d = PF_HD_BLKS - 1): no next-K load
+        {
+            constexpr int d = (int)PF_HD_BLKS - 1;
+            // V prefetch: half rate (every other D-block) — reduces memory pressure
+            if ((d & 1) == 0) {
+            payloadVpf.set_x(kv_head_off_u32 / 2 + sg_i * 16 + (d & 1) * 8);
+            payloadVpf.set_y(Y_base_V + (d >> 1) * 16);
+            __ESIMD_ENS::lsc_prefetch_2d<uint32_t, 8, 16, 1, false, false,
+                __ESIMD_ENS::cache_hint::cached,
+                __ESIMD_ENS::cache_hint::cached>(payloadVpf);
             }
+
+            simd<bf16, 128> K_sb0(K_both.select<128, 1>(0).template bit_cast_view<bf16>().data());
+            simd<bf16, 128> K_sb1(K_both.select<128, 1>(128).template bit_cast_view<bf16>().data());
+
+            uint32_t q_slm_off0 = PF_Q_SLM_BASE + (d * PF_Q_TILES + sg_j * PF_Q_PAIRS + 0) * 512;
+            uint32_t q_slm_off1 = PF_Q_SLM_BASE + (d * PF_Q_TILES + sg_j * PF_Q_PAIRS + 1) * 512;
+
+            simd<bf16, 256> Q_vnni0, Q_vnni1;
+            Q_vnni0.template bit_cast_view<uint32_t>().select<64, 1>(0) =
+                slm_block_load<uint32_t, 64>(q_slm_off0);
+            Q_vnni0.template bit_cast_view<uint32_t>().select<64, 1>(64) =
+                slm_block_load<uint32_t, 64>(q_slm_off0 + 256);
+            Q_vnni1.template bit_cast_view<uint32_t>().select<64, 1>(0) =
+                slm_block_load<uint32_t, 64>(q_slm_off1);
+            Q_vnni1.template bit_cast_view<uint32_t>().select<64, 1>(64) =
+                slm_block_load<uint32_t, 64>(q_slm_off1 + 256);
+
+            { auto acc = ST_tile.select<128, 1>(0);
+              acc = dpas<8, 8, float, float, bf16, bf16>(simd<float, 128>(acc.data()), simd<bf16, 256>(Q_vnni0.data()), K_sb0); }
+            { auto acc = ST_tile.select<128, 1>(128);
+              acc = dpas<8, 8, float, float, bf16, bf16>(simd<float, 128>(acc.data()), simd<bf16, 256>(Q_vnni0.data()), K_sb1); }
+            { auto acc = ST_tile.select<128, 1>(256);
+              acc = dpas<8, 8, float, float, bf16, bf16>(simd<float, 128>(acc.data()), simd<bf16, 256>(Q_vnni1.data()), K_sb0); }
+            { auto acc = ST_tile.select<128, 1>(384);
+              acc = dpas<8, 8, float, float, bf16, bf16>(simd<float, 128>(acc.data()), simd<bf16, 256>(Q_vnni1.data()), K_sb1); }
         }
     }
 
-    // Pre-compute the first outer iteration that needs masking.
-    // For iterations before this, no KV position exceeds any causal boundary,
-    // so masking is a no-op — skip it entirely for speed.
-    int32_t min_bound = causal_bound_0[0];
-    #pragma unroll
-    for (int i = 1; i < 16; i++) {
-        min_bound = (causal_bound_0[i] < min_bound) ? causal_bound_0[i] : min_bound;
-        min_bound = (causal_bound_1[i] < min_bound) ? causal_bound_1[i] : min_bound;
-    }
-    // Account for this sg_i's KV offset within the chunk
-    int32_t sg_kv_max_in_chunk = sg_i * PF_KV_PER_SG + PF_KV_PER_SG - 1;
-    int32_t firstMaskIter = (min_bound - sg_kv_max_in_chunk) / (int32_t)PF_KV_CHUNK;
-    if (firstMaskIter < 0) firstMaskIter = 0;
-    if (firstMaskIter > kvOuterLoops) firstMaskIter = kvOuterLoops;
-
     // ============================================================
-    // OUTER KV LOOP — ST_tile has QK[outerIter] scores on entry
+    // OUTER KV LOOP — single loop, ST_tile has QK[outerIter] scores on entry
     // ============================================================
     for (int32_t outerIter = 0; outerIter < kvOuterLoops; outerIter++) {
         uint32_t kv_start = outerIter * PF_KV_CHUNK;
@@ -683,8 +930,9 @@ ESIMD_INLINE void sdp_paged_prefill_dpas(
         // ========================================
         ST_tile *= attnScoreMul;
 
-        // Apply masks only when needed (causal + boundary + invalid-Q)
-        if (outerIter >= firstMaskIter) {
+        // Masking: CAUSAL applies causal_bound every iteration;
+        // noncausal only masks the last iteration for kv_pos >= seq_len and invalid Q rows.
+        if constexpr (CAUSAL) {
             int32_t kv_base_sg = kv_start + sg_i * PF_KV_PER_SG;
             #pragma unroll
             for (int kv = 0; kv < 16; kv++) {
@@ -692,6 +940,33 @@ ESIMD_INLINE void sdp_paged_prefill_dpas(
                 simd<int32_t, 16> v_kv_pos(kv_pos);
                 ST_tile.select<16, 1>(0 * 256 + kv * 16).merge(FP32_MIN, v_kv_pos > causal_bound_0);
                 ST_tile.select<16, 1>(1 * 256 + kv * 16).merge(FP32_MIN, v_kv_pos > causal_bound_1);
+            }
+        } else {
+            // Noncausal: only need masking in the last iteration
+            if (outerIter == kvOuterLoops - 1) {
+                int32_t kv_base_sg = kv_start + sg_i * PF_KV_PER_SG;
+                // Mask positions >= seq_len (partial last chunk)
+                #pragma unroll
+                for (int kv = 0; kv < 16; kv++) {
+                    int32_t kv_pos = kv_base_sg + kv;
+                    if (kv_pos >= seq_len) {
+                        ST_tile.select<16, 1>(0 * 256 + kv * 16) = FP32_MIN;
+                        ST_tile.select<16, 1>(1 * 256 + kv * 16) = FP32_MIN;
+                    }
+                }
+                // Mask invalid Q rows (actual_q_rows < 128)
+                if (actual_q_rows < (int)PF_WG_Q_ROWS) {
+                    simd<int32_t, 16> q_idx_vec;
+                    #pragma unroll
+                    for (int qr = 0; qr < 16; qr++) q_idx_vec[qr] = qr;
+                    simd<int32_t, 16> q_local_0 = sg_j * 32 + q_idx_vec;
+                    simd<int32_t, 16> q_local_1 = sg_j * 32 + 16 + q_idx_vec;
+                    #pragma unroll
+                    for (int kv = 0; kv < 16; kv++) {
+                        ST_tile.select<16, 1>(0 * 256 + kv * 16).merge(FP32_MIN, q_local_0 >= actual_q_rows);
+                        ST_tile.select<16, 1>(1 * 256 + kv * 16).merge(FP32_MIN, q_local_1 >= actual_q_rows);
+                    }
+                }
             }
         }
 
@@ -725,22 +1000,20 @@ ESIMD_INLINE void sdp_paged_prefill_dpas(
 
         if (outerIter < kvOuterLoops - 1) {
             uint32_t next_kv_start = (outerIter + 1) * PF_KV_CHUNK;
-            int32_t next_kv_pos = next_kv_start + sg_i * PF_KV_PER_SG;
-            int32_t next_blk_idx = next_kv_pos / block_size;
-            if (next_blk_idx > max_valid_blk_idx) next_blk_idx = 0;
-            int32_t next_blk_off = next_kv_pos & (block_size - 1);
-            int32_t next_blk_num = block_table_row[next_blk_idx];
+            int32_t next_logical = next_kv_start >> block_size_shift;
+            int32_t next_off = next_kv_start & block_size_mask;
+            int32_t next_phys = BLK_TABLE_LOAD(next_logical);
+            uint32_t next_Y_base_K = (uint32_t)((next_phys << block_size_shift) + next_off + sg_i * PF_KV_PER_SG);
+            uint32_t next_Y_base_V = (uint32_t)((next_phys << block_size_shift) + next_off);
 
             ST_next = 0;
 
-            payloadK = __ESIMD_ENS::config_2d_mem_access<fp16, 16, 16, 1>(
-                (fp16*)(kv_cache_ptr + (int64_t)next_blk_num * kv_stride_block),
-                kv_surf_w, kv_surf_h, kv_surf_w, kv_x_k, next_blk_off);
+            payloadK.set_y(next_Y_base_K);
             simd<fp16, 256> K_both = __ESIMD_ENS::lsc_load_2d<fp16, 16, 16, 1, false, false,
                 __ESIMD_ENS::cache_hint::cached, __ESIMD_ENS::cache_hint::cached>(payloadK);
 
             #pragma unroll
-            for (int d = 0; d < (int)PF_HD_BLKS; d++) {
+            for (int d = 0; d < (int)PF_HD_BLKS - 1; d++) {
                 simd<bf16, 128> K_sb0(K_both.select<128, 1>(0).template bit_cast_view<bf16>().data());
                 simd<bf16, 128> K_sb1(K_both.select<128, 1>(128).template bit_cast_view<bf16>().data());
 
@@ -766,10 +1039,57 @@ ESIMD_INLINE void sdp_paged_prefill_dpas(
                 { auto acc = ST_next.select<128, 1>(384);
                   acc = dpas<8, 8, float, float, bf16, bf16>(simd<float, 128>(acc.data()), simd<bf16, 256>(Q_vnni1.data()), K_sb1); }
 
-                if (d < (int)PF_HD_BLKS - 1) {
-                    payloadK.set_x(kv_x_k + (d + 1) * 16);
-                    K_both = __ESIMD_ENS::lsc_load_2d<fp16, 16, 16, 1, false, false,
-                        __ESIMD_ENS::cache_hint::cached, __ESIMD_ENS::cache_hint::cached>(payloadK);
+                // V prefetch for outerIter+1
+                // V prefetch: half rate (every other D-block) — reduces memory pressure
+                if ((d & 1) == 0) {
+                payloadVpf.set_x(kv_head_off_u32 / 2 + sg_i * 16 + (d & 1) * 8);
+                payloadVpf.set_y(next_Y_base_V + (d >> 1) * 16);
+                __ESIMD_ENS::lsc_prefetch_2d<uint32_t, 8, 16, 1, false, false,
+                    __ESIMD_ENS::cache_hint::cached,
+                    __ESIMD_ENS::cache_hint::cached>(payloadVpf);
+                }
+
+                payloadK.set_x(kv_x_k + (d + 1) * 16);
+                K_both = __ESIMD_ENS::lsc_load_2d<fp16, 16, 16, 1, false, false,
+                    __ESIMD_ENS::cache_hint::cached, __ESIMD_ENS::cache_hint::cached>(payloadK);
+            }
+
+            // Last D-block: no next-K load
+            {
+                constexpr int d = (int)PF_HD_BLKS - 1;
+                simd<bf16, 128> K_sb0(K_both.select<128, 1>(0).template bit_cast_view<bf16>().data());
+                simd<bf16, 128> K_sb1(K_both.select<128, 1>(128).template bit_cast_view<bf16>().data());
+
+                uint32_t q_slm_off0 = PF_Q_SLM_BASE + (d * PF_Q_TILES + sg_j * PF_Q_PAIRS + 0) * 512;
+                uint32_t q_slm_off1 = PF_Q_SLM_BASE + (d * PF_Q_TILES + sg_j * PF_Q_PAIRS + 1) * 512;
+
+                simd<bf16, 256> Q_vnni0, Q_vnni1;
+                Q_vnni0.template bit_cast_view<uint32_t>().select<64, 1>(0) =
+                    slm_block_load<uint32_t, 64>(q_slm_off0);
+                Q_vnni0.template bit_cast_view<uint32_t>().select<64, 1>(64) =
+                    slm_block_load<uint32_t, 64>(q_slm_off0 + 256);
+                Q_vnni1.template bit_cast_view<uint32_t>().select<64, 1>(0) =
+                    slm_block_load<uint32_t, 64>(q_slm_off1);
+                Q_vnni1.template bit_cast_view<uint32_t>().select<64, 1>(64) =
+                    slm_block_load<uint32_t, 64>(q_slm_off1 + 256);
+
+                { auto acc = ST_next.select<128, 1>(0);
+                  acc = dpas<8, 8, float, float, bf16, bf16>(simd<float, 128>(acc.data()), simd<bf16, 256>(Q_vnni0.data()), K_sb0); }
+                { auto acc = ST_next.select<128, 1>(128);
+                  acc = dpas<8, 8, float, float, bf16, bf16>(simd<float, 128>(acc.data()), simd<bf16, 256>(Q_vnni0.data()), K_sb1); }
+                { auto acc = ST_next.select<128, 1>(256);
+                  acc = dpas<8, 8, float, float, bf16, bf16>(simd<float, 128>(acc.data()), simd<bf16, 256>(Q_vnni1.data()), K_sb0); }
+                { auto acc = ST_next.select<128, 1>(384);
+                  acc = dpas<8, 8, float, float, bf16, bf16>(simd<float, 128>(acc.data()), simd<bf16, 256>(Q_vnni1.data()), K_sb1); }
+
+                // V prefetch last D-block
+                // V prefetch: half rate (every other D-block) — reduces memory pressure
+                if ((d & 1) == 0) {
+                payloadVpf.set_x(kv_head_off_u32 / 2 + sg_i * 16 + (d & 1) * 8);
+                payloadVpf.set_y(next_Y_base_V + (d >> 1) * 16);
+                __ESIMD_ENS::lsc_prefetch_2d<uint32_t, 8, 16, 1, false, false,
+                    __ESIMD_ENS::cache_hint::cached,
+                    __ESIMD_ENS::cache_hint::cached>(payloadVpf);
                 }
             }
         }
@@ -877,27 +1197,22 @@ ESIMD_INLINE void sdp_paged_prefill_dpas(
 
         fp32_sum = fp32_sum * delta + local_sum;
 
-        // Load V for kv_blk=0 via per-block 2D surface
-        int32_t v_kv_pos_0 = kv_start;
-        int32_t v_blk_idx_0 = v_kv_pos_0 / block_size;
-        if (v_blk_idx_0 > max_valid_blk_idx) v_blk_idx_0 = 0;
-        int32_t v_blk_off_0 = v_kv_pos_0 & (block_size - 1);
-        int32_t v_blk_num_0 = block_table_row[v_blk_idx_0];
+        // V phase: per-iteration block lookup (no blk_table_cache)
+        int32_t v_logical = kv_start >> block_size_shift;
+        int32_t v_off = kv_start & block_size_mask;
+        int32_t v_phys = BLK_TABLE_LOAD(v_logical);
+        uint32_t v_Y_base = (uint32_t)((v_phys << block_size_shift) + v_off);
 
-        // V surface: offset by kv_stride_split for value cache
-        // Use VNNI transform (last template arg = true) to get bf16 VNNI-packed directly
-        __ESIMD_ENS::config_2d_mem_access<fp16, 16, 16, 1> payloadV(
-            (fp16*)(kv_cache_ptr + (int64_t)v_blk_num_0 * kv_stride_block + kv_stride_split),
-            kv_surf_w, kv_surf_h, kv_surf_w,
-            (uint32_t)(kv_head_offset + sg_i * 32), v_blk_off_0);
-
+        // V load kv_blk=0
+        payloadV.set_x(kv_head_off_u32 + sg_i * 32);
+        payloadV.set_y(v_Y_base);
         simd<fp16, 256> V_vnni0 = __ESIMD_ENS::lsc_load_2d<fp16, 16, 16, 1, false, true,
             __ESIMD_ENS::cache_hint::cached, __ESIMD_ENS::cache_hint::cached>(payloadV);
-        payloadV.set_x((uint32_t)(kv_head_offset + sg_i * 32 + 16));
+        payloadV.set_x(kv_head_off_u32 + sg_i * 32 + 16);
         simd<fp16, 256> V_vnni1 = __ESIMD_ENS::lsc_load_2d<fp16, 16, 16, 1, false, true,
             __ESIMD_ENS::cache_hint::cached, __ESIMD_ENS::cache_hint::cached>(payloadV);
 
-        // Compensation (fp32 multiply — A_tile is fp32)
+        // Compensation
         #pragma unroll
         for (int qg = 0; qg < (int)PF_Q_GRPS; qg++) {
             #pragma unroll
@@ -913,52 +1228,74 @@ ESIMD_INLINE void sdp_paged_prefill_dpas(
         __esimd_nbarrier(0, 0, 32);
 
         // ========================================
-        // VS PHASE — reuse V surface across kv_blks in same page
-        // Note: no #pragma unroll — reduces register pressure
+        // VS PHASE + K PREFETCH (remaining tiles)
         // ========================================
-        for (int kv_blk = 0; kv_blk < (int)PF_KV_BLKS; kv_blk++) {
-            // Load V for this kv_blk
-            if (kv_blk > 0) {
-                int32_t v_kv_pos = kv_start + kv_blk * 16;
-                int32_t v_bo = v_kv_pos & (block_size - 1);
 
-                // Reuse V surface from kv_blk=0, just update Y
-                payloadV.set_x((uint32_t)(kv_head_offset + sg_i * 32));
-                payloadV.set_y(v_bo);
-                V_vnni0 = __ESIMD_ENS::lsc_load_2d<fp16, 16, 16, 1, false, true,
-                    __ESIMD_ENS::cache_hint::cached, __ESIMD_ENS::cache_hint::cached>(payloadV);
-                payloadV.set_x((uint32_t)(kv_head_offset + sg_i * 32 + 16));
-                V_vnni1 = __ESIMD_ENS::lsc_load_2d<fp16, 16, 16, 1, false, true,
-                    __ESIMD_ENS::cache_hint::cached, __ESIMD_ENS::cache_hint::cached>(payloadV);
-            }
+// Helper macro: load S from SLM, load V (skip for kv_blk 0), run 8 DPAS
+#define VS_LOAD_AND_DPAS(KV_BLK)                                                     \
+        do {                                                                          \
+            if ((KV_BLK) > 0) {                                                       \
+                payloadV.set_x(kv_head_off_u32 + sg_i * 32);               \
+                payloadV.set_y(v_Y_base + (KV_BLK) * 16);                             \
+                V_vnni0 = __ESIMD_ENS::lsc_load_2d<fp16, 16, 16, 1, false, true,     \
+                    __ESIMD_ENS::cache_hint::cached,                                  \
+                    __ESIMD_ENS::cache_hint::cached>(payloadV);                       \
+                payloadV.set_x(kv_head_off_u32 + sg_i * 32 + 16);          \
+                V_vnni1 = __ESIMD_ENS::lsc_load_2d<fp16, 16, 16, 1, false, true,     \
+                    __ESIMD_ENS::cache_hint::cached,                                  \
+                    __ESIMD_ENS::cache_hint::cached>(payloadV);                       \
+            }                                                                         \
+            uint32_t sb = PF_S_SLM_BASE + ((KV_BLK) * 16 + sg_j * PF_Q_GRPS) * 256; \
+            simd<bf16, 128> sA, sB, sC, sD;                                          \
+            sA.template bit_cast_view<uint32_t>() = slm_block_load<uint32_t, 64>(sb);           \
+            sB.template bit_cast_view<uint32_t>() = slm_block_load<uint32_t, 64>(sb + 256);     \
+            sC.template bit_cast_view<uint32_t>() = slm_block_load<uint32_t, 64>(sb + 512);     \
+            sD.template bit_cast_view<uint32_t>() = slm_block_load<uint32_t, 64>(sb + 768);     \
+            auto Vb0 = V_vnni0.template bit_cast_view<bf16>();                        \
+            auto Vb1 = V_vnni1.template bit_cast_view<bf16>();                        \
+            { auto acc = A_tile.select<128, 1>(0*128); acc = dpas<8,8,float,float,bf16,bf16>(simd<float,128>(acc.data()), simd<bf16,256>(Vb0.data()), sA); } \
+            { auto acc = A_tile.select<128, 1>(1*128); acc = dpas<8,8,float,float,bf16,bf16>(simd<float,128>(acc.data()), simd<bf16,256>(Vb1.data()), sA); } \
+            { auto acc = A_tile.select<128, 1>(2*128); acc = dpas<8,8,float,float,bf16,bf16>(simd<float,128>(acc.data()), simd<bf16,256>(Vb0.data()), sB); } \
+            { auto acc = A_tile.select<128, 1>(3*128); acc = dpas<8,8,float,float,bf16,bf16>(simd<float,128>(acc.data()), simd<bf16,256>(Vb1.data()), sB); } \
+            { auto acc = A_tile.select<128, 1>(4*128); acc = dpas<8,8,float,float,bf16,bf16>(simd<float,128>(acc.data()), simd<bf16,256>(Vb0.data()), sC); } \
+            { auto acc = A_tile.select<128, 1>(5*128); acc = dpas<8,8,float,float,bf16,bf16>(simd<float,128>(acc.data()), simd<bf16,256>(Vb1.data()), sC); } \
+            { auto acc = A_tile.select<128, 1>(6*128); acc = dpas<8,8,float,float,bf16,bf16>(simd<float,128>(acc.data()), simd<bf16,256>(Vb0.data()), sD); } \
+            { auto acc = A_tile.select<128, 1>(7*128); acc = dpas<8,8,float,float,bf16,bf16>(simd<float,128>(acc.data()), simd<bf16,256>(Vb1.data()), sD); } \
+        } while(0)
 
-            uint32_t s_base = PF_S_SLM_BASE + (kv_blk * 16 + sg_j * PF_Q_GRPS) * 256;
-            simd<bf16, 128> S0, S1, S2, S3;
-            S0.template bit_cast_view<uint32_t>() = slm_block_load<uint32_t, 64>(s_base);
-            S1.template bit_cast_view<uint32_t>() = slm_block_load<uint32_t, 64>(s_base + 256);
-            S2.template bit_cast_view<uint32_t>() = slm_block_load<uint32_t, 64>(s_base + 512);
-            S3.template bit_cast_view<uint32_t>() = slm_block_load<uint32_t, 64>(s_base + 768);
+#define K_PREFETCH_2(N)                                                                \
+        do {                                                                           \
+            payloadKpf.set_x((uint32_t)(kv_x_k / 2 + (2*(N)) * 8));                   \
+            __ESIMD_ENS::lsc_prefetch_2d<uint32_t, 16, 8, 1, false, false,            \
+                __ESIMD_ENS::cache_hint::cached,                                       \
+                __ESIMD_ENS::cache_hint::cached>(payloadKpf);                          \
+            payloadKpf.set_x((uint32_t)(kv_x_k / 2 + (2*(N)+1) * 8));                 \
+            __ESIMD_ENS::lsc_prefetch_2d<uint32_t, 16, 8, 1, false, false,            \
+                __ESIMD_ENS::cache_hint::cached,                                       \
+                __ESIMD_ENS::cache_hint::cached>(payloadKpf);                          \
+        } while(0)
 
-            auto V_bf16_0 = V_vnni0.template bit_cast_view<bf16>();
-            auto V_bf16_1 = V_vnni1.template bit_cast_view<bf16>();
-
-            { auto acc = A_tile.select<128, 1>(0 * 128);
-              acc = dpas<8, 8, float, float, bf16, bf16>(simd<float, 128>(acc.data()), simd<bf16, 256>(V_bf16_0.data()), S0); }
-            { auto acc = A_tile.select<128, 1>(1 * 128);
-              acc = dpas<8, 8, float, float, bf16, bf16>(simd<float, 128>(acc.data()), simd<bf16, 256>(V_bf16_1.data()), S0); }
-            { auto acc = A_tile.select<128, 1>(2 * 128);
-              acc = dpas<8, 8, float, float, bf16, bf16>(simd<float, 128>(acc.data()), simd<bf16, 256>(V_bf16_0.data()), S1); }
-            { auto acc = A_tile.select<128, 1>(3 * 128);
-              acc = dpas<8, 8, float, float, bf16, bf16>(simd<float, 128>(acc.data()), simd<bf16, 256>(V_bf16_1.data()), S1); }
-            { auto acc = A_tile.select<128, 1>(4 * 128);
-              acc = dpas<8, 8, float, float, bf16, bf16>(simd<float, 128>(acc.data()), simd<bf16, 256>(V_bf16_0.data()), S2); }
-            { auto acc = A_tile.select<128, 1>(5 * 128);
-              acc = dpas<8, 8, float, float, bf16, bf16>(simd<float, 128>(acc.data()), simd<bf16, 256>(V_bf16_1.data()), S2); }
-            { auto acc = A_tile.select<128, 1>(6 * 128);
-              acc = dpas<8, 8, float, float, bf16, bf16>(simd<float, 128>(acc.data()), simd<bf16, 256>(V_bf16_0.data()), S3); }
-            { auto acc = A_tile.select<128, 1>(7 * 128);
-              acc = dpas<8, 8, float, float, bf16, bf16>(simd<float, 128>(acc.data()), simd<bf16, 256>(V_bf16_1.data()), S3); }
+        // K prefetch for outerIter+2: compute address
+        {
+            int32_t pf_kv_start = (outerIter + 2) * (int32_t)PF_KV_CHUNK;
+            int32_t pf_logical = pf_kv_start >> block_size_shift;
+            pf_logical = (pf_logical <= max_valid_blk_idx) ? pf_logical : max_valid_blk_idx;
+            int32_t pf_off = pf_kv_start & block_size_mask;
+            int32_t pf_phys = BLK_TABLE_LOAD(pf_logical);
+            payloadKpf.set_y((uint32_t)((pf_phys << block_size_shift) + pf_off + sg_i * (int32_t)PF_KV_PER_SG));
         }
+
+        VS_LOAD_AND_DPAS(0);  K_PREFETCH_2(0);
+        VS_LOAD_AND_DPAS(1);  K_PREFETCH_2(1);
+        VS_LOAD_AND_DPAS(2);  K_PREFETCH_2(2);
+        VS_LOAD_AND_DPAS(3);  K_PREFETCH_2(3);
+        VS_LOAD_AND_DPAS(4);  K_PREFETCH_2(4);
+        VS_LOAD_AND_DPAS(5);  K_PREFETCH_2(5);
+        VS_LOAD_AND_DPAS(6);  K_PREFETCH_2(6);
+        VS_LOAD_AND_DPAS(7);  K_PREFETCH_2(7);
+
+#undef K_PREFETCH_2
+#undef VS_LOAD_AND_DPAS
 
         ST_tile = ST_next;
     }
@@ -1001,7 +1338,6 @@ ESIMD_INLINE void sdp_paged_prefill_dpas(
     for (int qg = 0; qg < (int)PF_Q_GRPS; qg++) {
         #pragma unroll
         for (int db = 0; db < (int)PF_D_BLKS_PER_SG; db++) {
-            // A_tile is fp32 — normalize and convert to bf16 for output
             simd<fp16, 128> fOut_fp16;
 
             #pragma unroll
@@ -1035,4 +1371,5 @@ ESIMD_INLINE void sdp_paged_prefill_dpas(
             }
         }
     }
+#undef BLK_TABLE_LOAD
 }
