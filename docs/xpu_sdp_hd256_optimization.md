@@ -168,6 +168,21 @@ Uses `lsc_load_2d` / `lsc_prefetch_2d` with `config_2d_mem_access` surface descr
 Enables hardware 2D blocking — each thread loads its portion of the K/V tile without
 manual offset arithmetic. Critical for DPAS operand preparation.
 
+### Interleaved KV Cache Layout Handling (Critical Bug Fix)
+vLLM allocates KV cache as physical `[num_blocks, 2, block_size, nkvh, hd]` but presents
+the logical shape `[2, num_blocks, block_size, nkvh, hd]` via `permute`. This means:
+- `stride(0) = block_size * nkvh * hd` (K→V offset within same physical block)
+- `stride(1) = 2 * block_size * nkvh * hd` (block stride spans K+V)
+- Physical rows per block = `stride(1)/stride(2) = 2 * block_size`, NOT `block_size`
+
+The kernel must use `phys_block_shift = __builtin_ctz(stride(1)/stride(2))` for 2D surface
+Y coordinate computation, NOT `block_size_shift`. Using `block_size_shift` gives wrong
+addresses for interleaved layouts and produces garbage output on multi-token prefill.
+
+**Symptom**: 1-token decode works (uses scalar path, not 2D surface), but multi-token
+prefill produces "!!!" garbage. Standalone tests with contiguous KV cache pass because
+`phys_block_shift == block_size_shift` for contiguous layout.
+
 ### Causal Mask Implementation
 `template<bool CAUSAL>` with `if constexpr` for zero-cost abstraction:
 - Causal path: computes `causal_bound` per Q-row, uses `merge()` to mask scores to `-inf`
