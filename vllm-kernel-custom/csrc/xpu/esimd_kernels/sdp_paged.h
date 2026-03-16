@@ -692,14 +692,20 @@ ESIMD_INLINE void sdp_paged_prefill_dpas(
     // Convert int64 strides to uint32 derived values immediately — free int64 regs
     uint32_t kv_head_off_u32 = (uint32_t)((int64_t)kv_head_idx * kv_stride_head);
     uint32_t kv_row_bytes = (uint32_t)(kv_stride_pos * 2);
-    int32_t num_blocks_total = (int32_t)(kv_stride_split / kv_stride_block);
     const unsigned short* kv_v_base = kv_cache_ptr + kv_stride_split;
 
     const int* block_table_row = block_table_ptr + (int64_t)req_idx * max_blocks_per_seq;
-    // block_size is always power of 2 — use shift for division
+    // block_size is always power of 2 — use shift for division/modulo
     int32_t block_size_shift = __builtin_ctz(block_size);
     int32_t block_size_mask = block_size - 1;
     int32_t max_valid_blk_idx = (seq_len - 1) >> block_size_shift;
+
+    // Physical rows per block in the 2D surface.
+    // For contiguous [2, num_blocks, bs, nkvh, hd]: phys_rows_per_block = bs
+    // For interleaved [num_blocks, 2, bs, nkvh, hd] presented as [2, ...]:
+    //   phys_rows_per_block = stride(1)/stride(2) = 2*bs (K+V interleaved per block)
+    int32_t phys_rows_per_block = (int32_t)(kv_stride_block / kv_stride_pos);
+    int32_t phys_block_shift = __builtin_ctz(phys_rows_per_block);
 
 // Experiment: bypass block table to measure overhead
 #ifdef PAGED_BYPASS_BLOCK_TABLE
@@ -713,7 +719,8 @@ ESIMD_INLINE void sdp_paged_prefill_dpas(
 
     // 2D surface parameters — FIXED BASE for entire KV cache
     uint32_t kv_surf_w = kv_row_bytes - 1;
-    uint32_t kv_surf_h = (uint32_t)((num_blocks_total << block_size_shift) - 1);
+    // Safe upper bound for surface height — covers any practical allocation
+    uint32_t kv_surf_h = 0x3FFFFFU;
     uint32_t kv_x_k = kv_head_off_u32;
 
     // ============================================================
@@ -803,7 +810,7 @@ ESIMD_INLINE void sdp_paged_prefill_dpas(
     // ============================================================
     {
         int32_t pf0_phys = BLK_TABLE_LOAD(0);
-        payloadKpf.set_y((uint32_t)((pf0_phys << block_size_shift) + sg_i * (int32_t)PF_KV_PER_SG));
+        payloadKpf.set_y((uint32_t)((pf0_phys << phys_block_shift) + sg_i * (int32_t)PF_KV_PER_SG));
         #pragma unroll
         for (int d = 0; d < (int)PF_HD_BLKS; d++) {
             payloadKpf.set_x((uint32_t)(kv_x_k / 2 + d * 8));
@@ -815,7 +822,7 @@ ESIMD_INLINE void sdp_paged_prefill_dpas(
         int32_t pf1_logical = (int32_t)PF_KV_CHUNK >> block_size_shift;
         int32_t pf1_off = (int32_t)PF_KV_CHUNK & block_size_mask;
         int32_t pf1_phys = BLK_TABLE_LOAD(pf1_logical);
-        payloadKpf.set_y((uint32_t)((pf1_phys << block_size_shift) + pf1_off + sg_i * (int32_t)PF_KV_PER_SG));
+        payloadKpf.set_y((uint32_t)((pf1_phys << phys_block_shift) + pf1_off + sg_i * (int32_t)PF_KV_PER_SG));
         #pragma unroll
         for (int d = 0; d < (int)PF_HD_BLKS; d++) {
             payloadKpf.set_x((uint32_t)(kv_x_k / 2 + d * 8));
@@ -830,8 +837,8 @@ ESIMD_INLINE void sdp_paged_prefill_dpas(
     // ============================================================
     {
         int32_t phys0 = BLK_TABLE_LOAD(0);
-        uint32_t Y_base_K = (uint32_t)((phys0 << block_size_shift) + sg_i * PF_KV_PER_SG);
-        uint32_t Y_base_V = (uint32_t)(phys0 << block_size_shift);
+        uint32_t Y_base_K = (uint32_t)((phys0 << phys_block_shift) + sg_i * PF_KV_PER_SG);
+        uint32_t Y_base_V = (uint32_t)(phys0 << phys_block_shift);
 
         ST_tile = 0;
 
@@ -1003,8 +1010,8 @@ ESIMD_INLINE void sdp_paged_prefill_dpas(
             int32_t next_logical = next_kv_start >> block_size_shift;
             int32_t next_off = next_kv_start & block_size_mask;
             int32_t next_phys = BLK_TABLE_LOAD(next_logical);
-            uint32_t next_Y_base_K = (uint32_t)((next_phys << block_size_shift) + next_off + sg_i * PF_KV_PER_SG);
-            uint32_t next_Y_base_V = (uint32_t)((next_phys << block_size_shift) + next_off);
+            uint32_t next_Y_base_K = (uint32_t)((next_phys << phys_block_shift) + next_off + sg_i * PF_KV_PER_SG);
+            uint32_t next_Y_base_V = (uint32_t)((next_phys << phys_block_shift) + next_off);
 
             ST_next = 0;
 
@@ -1201,7 +1208,7 @@ ESIMD_INLINE void sdp_paged_prefill_dpas(
         int32_t v_logical = kv_start >> block_size_shift;
         int32_t v_off = kv_start & block_size_mask;
         int32_t v_phys = BLK_TABLE_LOAD(v_logical);
-        uint32_t v_Y_base = (uint32_t)((v_phys << block_size_shift) + v_off);
+        uint32_t v_Y_base = (uint32_t)((v_phys << phys_block_shift) + v_off);
 
         // V load kv_blk=0
         payloadV.set_x(kv_head_off_u32 + sg_i * 32);
@@ -1282,7 +1289,7 @@ ESIMD_INLINE void sdp_paged_prefill_dpas(
             pf_logical = (pf_logical <= max_valid_blk_idx) ? pf_logical : max_valid_blk_idx;
             int32_t pf_off = pf_kv_start & block_size_mask;
             int32_t pf_phys = BLK_TABLE_LOAD(pf_logical);
-            payloadKpf.set_y((uint32_t)((pf_phys << block_size_shift) + pf_off + sg_i * (int32_t)PF_KV_PER_SG));
+            payloadKpf.set_y((uint32_t)((pf_phys << phys_block_shift) + pf_off + sg_i * (int32_t)PF_KV_PER_SG));
         }
 
         VS_LOAD_AND_DPAS(0);  K_PREFETCH_2(0);
