@@ -36,6 +36,7 @@ class EsimdAttentionBackend(AttentionBackend):
     forward_includes_kv_cache_update: bool = False
     supported_dtypes: ClassVar[list[torch.dtype]] = [
         torch.bfloat16,
+        torch.float16,
     ]
 
     @classmethod
@@ -181,15 +182,15 @@ class EsimdAttentionImpl(AttentionImpl):
         """Forward pass using ESIMD paged SDP kernel.
 
         Args:
-            query: [num_tokens, num_heads, head_size] bf16
-            key: [num_tokens, num_kv_heads, head_size] bf16
-            value: [num_tokens, num_kv_heads, head_size] bf16
-            kv_cache: [2, num_blocks, block_size, num_kv_heads, head_size] bf16
+            query: [num_tokens, num_heads, head_size] bf16/fp16
+            key: [num_tokens, num_kv_heads, head_size] bf16/fp16
+            value: [num_tokens, num_kv_heads, head_size] bf16/fp16
+            kv_cache: [2, num_blocks, block_size, num_kv_heads, head_size]
             attn_metadata: ESIMD attention metadata
-            output: [num_tokens, num_heads, head_size] bf16 (pre-allocated)
+            output: [num_tokens, num_heads, head_size] bf16/fp16
 
         Returns:
-            output: [num_tokens, num_heads * head_size] bf16
+            output: [num_tokens, num_heads * head_size] bf16/fp16
         """
         assert output is not None, "Output tensor must be provided."
 
@@ -203,11 +204,15 @@ class EsimdAttentionImpl(AttentionImpl):
         # Determine block_size from KV cache shape
         block_size = kv_cache.shape[2]
 
+        # ESIMD kernel natively supports both bf16 and fp16
+        q_slice = query[:num_actual_tokens]
+        o_slice = output[:num_actual_tokens]
+
         # Call ESIMD paged SDP kernel (stride-aware, handles any layout)
         esimd_sdp_paged(
-            query[:num_actual_tokens],
+            q_slice,
             kv_cache,
-            output[:num_actual_tokens],
+            o_slice,
             attn_metadata.block_table,
             attn_metadata.seq_lens,
             attn_metadata.query_start_loc,

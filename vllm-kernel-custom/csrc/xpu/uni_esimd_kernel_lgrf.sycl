@@ -476,9 +476,9 @@ at::Tensor esimd_gdn_update(
  *       host-side WG dispatch tables; will be enabled in a follow-up.
  * ============================================================ */
 at::Tensor esimd_sdp_paged(
-    at::Tensor query,           // [num_tokens, num_heads, head_dim] bf16
-    at::Tensor kv_cache,        // [2, num_blocks, block_size, num_kv_heads, head_dim] bf16
-    at::Tensor output,          // [num_tokens, num_heads, head_dim] bf16
+    at::Tensor query,           // [num_tokens, num_heads, head_dim] bf16/fp16
+    at::Tensor kv_cache,        // [2, num_blocks, block_size, num_kv_heads, head_dim] bf16/fp16
+    at::Tensor output,          // [num_tokens, num_heads, head_dim] bf16/fp16
     at::Tensor block_table,     // [batch, max_blocks_per_seq] i32
     at::Tensor seq_lens,        // [batch] i32
     at::Tensor query_start_loc, // [batch+1] i32
@@ -506,11 +506,14 @@ at::Tensor esimd_sdp_paged(
     float as_f = (float)attn_scale;
     int c_val = (int)causal;
 
-    // Extract KV cache strides (in bf16 elements) from the tensor.
+    // Extract KV cache strides (in elements) from the tensor.
     int64_t kv_s0 = kv_cache.stride(0);  // split (K vs V)
     int64_t kv_s1 = kv_cache.stride(1);  // block
     int64_t kv_s2 = kv_cache.stride(2);  // position within block
     int64_t kv_s3 = kv_cache.stride(3);  // kv head
+
+    // Detect dtype: bf16 or fp16
+    bool is_bf16 = (query.scalar_type() == at::ScalarType::BFloat16);
 
     // Determine decode vs prefill
     bool is_decode = (num_tokens == batch);
@@ -521,75 +524,174 @@ at::Tensor esimd_sdp_paged(
         int num_chunks = (max_sl + DEC_GQA_CHUNK_SIZE - 1) / DEC_GQA_CHUNK_SIZE;
 
         // Allocate scratch buffer for phase1 partials
-        // Layout: [batch, num_heads, num_chunks, DEC_SCRATCH_PER_CHUNK/4] float
         int64_t scratch_elements = (int64_t)batch * nh * num_chunks * (DEC_SCRATCH_PER_CHUNK / 4);
         auto scratch = at::empty({scratch_elements}, query.options().dtype(at::kFloat));
         auto* scratch_ptr = scratch.data_ptr<float>();
 
-        // Phase 1 (GQA): one thread per (request, kv_head, chunk)
-        // Each thread processes all Q heads in its GQA group, sharing K/V loads
         int64_t p1_threads = (int64_t)batch * nkvh * num_chunks;
         sycl::nd_range<1> p1_range(sycl::range<1>(p1_threads), sycl::range<1>(1));
 
-        dpcpp_queue.submit([&](sycl::handler& cgh) {
-            cgh.parallel_for(p1_range, [=](sycl::nd_item<1> ndi) SYCL_ESIMD_KERNEL {
-                sdp_paged_decode_gqa_phase1(
-                    query_us, kv_cache_us, scratch_ptr,
-                    block_table_i, seq_lens_i,
-                    nh, nkvh, hd, bs, mbps,
-                    kv_s0, kv_s1, kv_s2, kv_s3,
-                    as_f, num_chunks, ndi);
-            });
-        });
-
-        // Phase 2: one thread per (request, head)
         int64_t p2_threads = (int64_t)batch * nh;
         sycl::nd_range<1> p2_range(sycl::range<1>(p2_threads), sycl::range<1>(1));
 
-        dpcpp_queue.submit([&](sycl::handler& cgh) {
-            cgh.parallel_for(p2_range, [=](sycl::nd_item<1> ndi) SYCL_ESIMD_KERNEL {
-                sdp_paged_decode_phase2(
-                    scratch_ptr, output_us, seq_lens_i,
-                    nh, hd, num_chunks, ndi);
+        if (is_bf16) {
+            dpcpp_queue.submit([&](sycl::handler& cgh) {
+                cgh.parallel_for(p1_range, [=](sycl::nd_item<1> ndi) SYCL_ESIMD_KERNEL {
+                    sdp_paged_decode_gqa_phase1<true>(
+                        query_us, kv_cache_us, scratch_ptr,
+                        block_table_i, seq_lens_i,
+                        nh, nkvh, hd, bs, mbps,
+                        kv_s0, kv_s1, kv_s2, kv_s3,
+                        as_f, num_chunks, ndi);
+                });
             });
-        });
+            dpcpp_queue.submit([&](sycl::handler& cgh) {
+                cgh.parallel_for(p2_range, [=](sycl::nd_item<1> ndi) SYCL_ESIMD_KERNEL {
+                    sdp_paged_decode_phase2<true>(
+                        scratch_ptr, output_us, seq_lens_i,
+                        nh, hd, num_chunks, ndi);
+                });
+            });
+        } else {
+            dpcpp_queue.submit([&](sycl::handler& cgh) {
+                cgh.parallel_for(p1_range, [=](sycl::nd_item<1> ndi) SYCL_ESIMD_KERNEL {
+                    sdp_paged_decode_gqa_phase1<false>(
+                        query_us, kv_cache_us, scratch_ptr,
+                        block_table_i, seq_lens_i,
+                        nh, nkvh, hd, bs, mbps,
+                        kv_s0, kv_s1, kv_s2, kv_s3,
+                        as_f, num_chunks, ndi);
+                });
+            });
+            dpcpp_queue.submit([&](sycl::handler& cgh) {
+                cgh.parallel_for(p2_range, [=](sycl::nd_item<1> ndi) SYCL_ESIMD_KERNEL {
+                    sdp_paged_decode_phase2<false>(
+                        scratch_ptr, output_us, seq_lens_i,
+                        nh, hd, num_chunks, ndi);
+                });
+            });
+        }
     } else if (hd == 256) {
         // ===== Prefill HD=256: DPAS-based 32-thread WG kernel =====
-        // Compute max_query_len for dispatch grid
-        int max_query_len_approx = (num_tokens + batch - 1) / batch;
-        // Use num_tokens as safe upper bound for max q tiles per request
         int max_q_tiles_per_req = (num_tokens + 127) / 128;
 
         int64_t total_wgs = (int64_t)batch * max_q_tiles_per_req * nh;
         sycl::nd_range<1> Range(sycl::range<1>(total_wgs * 32), sycl::range<1>(32));
 
-        if (c_val) {
-            dpcpp_queue.submit([&](sycl::handler& cgh) {
-                cgh.parallel_for(Range, [=](sycl::nd_item<1> ndi) SYCL_ESIMD_KERNEL {
-                    sdp_paged_prefill_dpas<true>(
-                        query_us, kv_cache_us, output_us,
-                        block_table_i, seq_lens_i, qsl_i,
-                        nh, nkvh, hd, bs, mbps,
-                        kv_s0, kv_s1, kv_s2, kv_s3,
-                        as_f, num_tokens,
-                        max_q_tiles_per_req, batch, ndi);
+        if (is_bf16) {
+            if (c_val) {
+                dpcpp_queue.submit([&](sycl::handler& cgh) {
+                    cgh.parallel_for(Range, [=](sycl::nd_item<1> ndi) SYCL_ESIMD_KERNEL {
+                        sdp_paged_prefill_dpas<true, true>(
+                            query_us, kv_cache_us, output_us,
+                            block_table_i, seq_lens_i, qsl_i,
+                            nh, nkvh, hd, bs, mbps,
+                            kv_s0, kv_s1, kv_s2, kv_s3,
+                            as_f, num_tokens,
+                            max_q_tiles_per_req, batch, ndi);
+                    });
                 });
-            });
+            } else {
+                dpcpp_queue.submit([&](sycl::handler& cgh) {
+                    cgh.parallel_for(Range, [=](sycl::nd_item<1> ndi) SYCL_ESIMD_KERNEL {
+                        sdp_paged_prefill_dpas<false, true>(
+                            query_us, kv_cache_us, output_us,
+                            block_table_i, seq_lens_i, qsl_i,
+                            nh, nkvh, hd, bs, mbps,
+                            kv_s0, kv_s1, kv_s2, kv_s3,
+                            as_f, num_tokens,
+                            max_q_tiles_per_req, batch, ndi);
+                    });
+                });
+            }
         } else {
-            dpcpp_queue.submit([&](sycl::handler& cgh) {
-                cgh.parallel_for(Range, [=](sycl::nd_item<1> ndi) SYCL_ESIMD_KERNEL {
-                    sdp_paged_prefill_dpas<false>(
-                        query_us, kv_cache_us, output_us,
-                        block_table_i, seq_lens_i, qsl_i,
-                        nh, nkvh, hd, bs, mbps,
-                        kv_s0, kv_s1, kv_s2, kv_s3,
-                        as_f, num_tokens,
-                        max_q_tiles_per_req, batch, ndi);
+            if (c_val) {
+                dpcpp_queue.submit([&](sycl::handler& cgh) {
+                    cgh.parallel_for(Range, [=](sycl::nd_item<1> ndi) SYCL_ESIMD_KERNEL {
+                        sdp_paged_prefill_dpas<true, false>(
+                            query_us, kv_cache_us, output_us,
+                            block_table_i, seq_lens_i, qsl_i,
+                            nh, nkvh, hd, bs, mbps,
+                            kv_s0, kv_s1, kv_s2, kv_s3,
+                            as_f, num_tokens,
+                            max_q_tiles_per_req, batch, ndi);
+                    });
                 });
-            });
+            } else {
+                dpcpp_queue.submit([&](sycl::handler& cgh) {
+                    cgh.parallel_for(Range, [=](sycl::nd_item<1> ndi) SYCL_ESIMD_KERNEL {
+                        sdp_paged_prefill_dpas<false, false>(
+                            query_us, kv_cache_us, output_us,
+                            block_table_i, seq_lens_i, qsl_i,
+                            nh, nkvh, hd, bs, mbps,
+                            kv_s0, kv_s1, kv_s2, kv_s3,
+                            as_f, num_tokens,
+                            max_q_tiles_per_req, batch, ndi);
+                    });
+                });
+            }
+        }
+    } else if (!is_decode && hd == 128) {
+        // ===== Prefill HD=128: 16-thread WG DPAS kernel =====
+        int max_q_tiles_per_req = (num_tokens + 255) / 256;  // 256 Q rows/WG
+        int64_t total_wgs = (int64_t)batch * max_q_tiles_per_req * nh;
+        sycl::nd_range<1> Range(sycl::range<1>(total_wgs * 16), sycl::range<1>(16));
+
+        if (is_bf16) {
+            if (c_val) {
+                dpcpp_queue.submit([&](sycl::handler& cgh) {
+                    cgh.parallel_for(Range, [=](sycl::nd_item<1> ndi) SYCL_ESIMD_KERNEL {
+                        sdp_paged_prefill_dpas_128<true, true>(
+                            query_us, kv_cache_us, output_us,
+                            block_table_i, seq_lens_i, qsl_i,
+                            nh, nkvh, hd, bs, mbps,
+                            kv_s0, kv_s1, kv_s2, kv_s3,
+                            as_f, num_tokens,
+                            max_q_tiles_per_req, batch, ndi);
+                    });
+                });
+            } else {
+                dpcpp_queue.submit([&](sycl::handler& cgh) {
+                    cgh.parallel_for(Range, [=](sycl::nd_item<1> ndi) SYCL_ESIMD_KERNEL {
+                        sdp_paged_prefill_dpas_128<false, true>(
+                            query_us, kv_cache_us, output_us,
+                            block_table_i, seq_lens_i, qsl_i,
+                            nh, nkvh, hd, bs, mbps,
+                            kv_s0, kv_s1, kv_s2, kv_s3,
+                            as_f, num_tokens,
+                            max_q_tiles_per_req, batch, ndi);
+                    });
+                });
+            }
+        } else {
+            if (c_val) {
+                dpcpp_queue.submit([&](sycl::handler& cgh) {
+                    cgh.parallel_for(Range, [=](sycl::nd_item<1> ndi) SYCL_ESIMD_KERNEL {
+                        sdp_paged_prefill_dpas_128<true, false>(
+                            query_us, kv_cache_us, output_us,
+                            block_table_i, seq_lens_i, qsl_i,
+                            nh, nkvh, hd, bs, mbps,
+                            kv_s0, kv_s1, kv_s2, kv_s3,
+                            as_f, num_tokens,
+                            max_q_tiles_per_req, batch, ndi);
+                    });
+                });
+            } else {
+                dpcpp_queue.submit([&](sycl::handler& cgh) {
+                    cgh.parallel_for(Range, [=](sycl::nd_item<1> ndi) SYCL_ESIMD_KERNEL {
+                        sdp_paged_prefill_dpas_128<false, false>(
+                            query_us, kv_cache_us, output_us,
+                            block_table_i, seq_lens_i, qsl_i,
+                            nh, nkvh, hd, bs, mbps,
+                            kv_s0, kv_s1, kv_s2, kv_s3,
+                            as_f, num_tokens,
+                            max_q_tiles_per_req, batch, ndi);
+                    });
+                });
+            }
         }
     } else {
-        // ===== Prefill non-256 head dim: scalar fallback =====
+        // ===== Decode or non-128/256 head dim: scalar fallback =====
         int max_query_len = 0;
         if (num_tokens == batch) {
             max_query_len = 1;
@@ -602,16 +704,29 @@ at::Tensor esimd_sdp_paged(
         int64_t num_threads = (int64_t)num_tokens * nh;
         sycl::nd_range<1> Range(sycl::range<1>(num_threads), sycl::range<1>(1));
 
-        dpcpp_queue.submit([&](sycl::handler& cgh) {
-            cgh.parallel_for(Range, [=](sycl::nd_item<1> ndi) SYCL_ESIMD_KERNEL {
-                sdp_paged_kernel_scalar(
-                    query_us, kv_cache_us, output_us,
-                    block_table_i, seq_lens_i, qsl_i,
-                    nh, nkvh, hd, bs, mbps,
-                    kv_s0, kv_s1, kv_s2, kv_s3,
-                    as_f, c_val, mql, ndi);
+        if (is_bf16) {
+            dpcpp_queue.submit([&](sycl::handler& cgh) {
+                cgh.parallel_for(Range, [=](sycl::nd_item<1> ndi) SYCL_ESIMD_KERNEL {
+                    sdp_paged_kernel_scalar<true>(
+                        query_us, kv_cache_us, output_us,
+                        block_table_i, seq_lens_i, qsl_i,
+                        nh, nkvh, hd, bs, mbps,
+                        kv_s0, kv_s1, kv_s2, kv_s3,
+                        as_f, c_val, mql, ndi);
+                });
             });
-        });
+        } else {
+            dpcpp_queue.submit([&](sycl::handler& cgh) {
+                cgh.parallel_for(Range, [=](sycl::nd_item<1> ndi) SYCL_ESIMD_KERNEL {
+                    sdp_paged_kernel_scalar<false>(
+                        query_us, kv_cache_us, output_us,
+                        block_table_i, seq_lens_i, qsl_i,
+                        nh, nkvh, hd, bs, mbps,
+                        kv_s0, kv_s1, kv_s2, kv_s3,
+                        as_f, c_val, mql, ndi);
+                });
+            });
+        }
     }
 
     return output;
