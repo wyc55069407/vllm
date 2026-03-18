@@ -1,11 +1,11 @@
-/* sdp_paged.h — Optimized paged SDP kernels (HD=256, bf16io).
+/* sdp_paged.h — Optimized paged SDP kernels for Intel BMG XPU.
  *
- * Five kernels:
- *   1. sdp_paged_kernel_scalar      — Scalar fallback for decode/prefill (all HD)
- *   2. sdp_paged_decode_phase1      — Per-chunk partial softmax for decode (legacy)
- *   3. sdp_paged_decode_phase2      — Cross-chunk log-sum-exp reduction
- *   4. sdp_paged_decode_gqa_phase1  — GQA-optimized decode: Q_HEAD_PER_T=4, K/V shared
- *   5. sdp_paged_prefill_dpas       — DPAS-based prefill (HD=256, 32-thread WG)
+ * Kernels:
+ *   1. sdp_paged_kernel_scalar          — Scalar fallback for decode/prefill (all HD)
+ *   2. sdp_paged_decode_opt_phase1      — Optimized two-phase decode phase 1 (WG+SLM)
+ *   3. sdp_paged_decode_opt_phase2      — Optimized two-phase decode phase 2 (reduction)
+ *   4. sdp_paged_prefill_dpas           — DPAS-based prefill (HD=256, 32-thread WG)
+ *   5. sdp_paged_prefill_dpas_128       — DPAS-based prefill (HD=128, 16-thread WG)
  *
  * KV cache layout: [2, num_blocks, block_size, num_kv_heads, head_dim] bf16 (NHD).
  *   kv_cache[0] = key cache, kv_cache[1] = value cache.
@@ -20,14 +20,6 @@
 #endif
 
 using bf16 = sycl::ext::oneapi::bfloat16;
-
-/* ============================================================
- * Constants for decode kernel
- * ============================================================ */
-static constexpr int DEC_CHUNK_SIZE = 128;  // KV tokens per chunk in phase1
-static constexpr int DEC_SCRATCH_PER_CHUNK = 528;  // bytes: 4+4+512 padded to 16B
-static constexpr int DEC_GQA_GROUP_SIZE = 4;   // Q heads per KV head (Qwen3.5-4B: 16Q/4KV)
-static constexpr int DEC_GQA_CHUNK_SIZE = 64;  // KV tokens per chunk (tunable: 32/64/128)
 
 /* ============================================================
  * ESIMD scalar math helpers
@@ -259,377 +251,480 @@ ESIMD_INLINE void sdp_paged_kernel_scalar(
 
 
 /* ============================================================
- * DECODE PHASE 1 — Per-chunk partial softmax + output
+ * Scratch layout for optimized decode kernels (fp32, like reference).
+ * Three separate buffers indexed by [chunk_idx * num_heads + head_idx]:
+ *   scratch_out : float[num_chunks * num_heads * HD]  — partial output (fp32)
+ *   scratch_max : float[num_chunks * num_heads]       — partial max
+ *   scratch_lse : float[num_chunks * num_heads]       — partial lse
  *
- * One ESIMD thread per (request, head, chunk).
- * Processes DEC_CHUNK_SIZE KV tokens, computes partial
- * (max_score, sum_exp, output[head_dim]) and stores to scratch.
- *
- * Scratch layout per chunk (DEC_SCRATCH_PER_CHUNK bytes):
- *   float max_score;        // offset 0
- *   float sum_exp;          // offset 4
- *   bf16  output[256];      // offset 8, 512 bytes
- *   Total: 520B, padded to 528 for alignment
+ * Total per chunk per head: HD*4 + 4 + 4 bytes = 520B (HD=128), 1032B (HD=256)
  * ============================================================ */
-template<bool IS_BF16>
-ESIMD_INLINE void sdp_paged_decode_phase1(
-    const unsigned short* __restrict__ query_ptr,
-    const unsigned short* __restrict__ kv_cache_ptr,
-    float* __restrict__ scratch_ptr,
-    const int* __restrict__ block_table_ptr,
-    const int* __restrict__ seq_lens_ptr,
-    int num_heads, int num_kv_heads, int head_dim,
-    int block_size, int max_blocks_per_seq,
-    int64_t kv_stride_split, int64_t kv_stride_block,
-    int64_t kv_stride_pos, int64_t kv_stride_head,
-    float attn_scale,
-    int num_chunks_per_seq,
-    nd_item<1>& ndi)
-{
-    const int global_id = ndi.get_global_id(0);
-    const int chunk_id = global_id % num_chunks_per_seq;
-    const int head_idx = (global_id / num_chunks_per_seq) % num_heads;
-    const int req_idx = global_id / (num_chunks_per_seq * num_heads);
-
-    const int seq_len = seq_lens_ptr[req_idx];
-
-    // Chunk bounds
-    int kv_start = chunk_id * DEC_CHUNK_SIZE;
-    if (kv_start >= seq_len) {
-        // This chunk is beyond the sequence — write sentinel
-        int scratch_idx = (req_idx * num_heads + head_idx) * num_chunks_per_seq + chunk_id;
-        int scratch_offset = scratch_idx * (DEC_SCRATCH_PER_CHUNK / 4);
-        scratch_ptr[scratch_offset] = FP32_MIN;  // max
-        scratch_ptr[scratch_offset + 1] = 0.0f;  // sum
-        return;
-    }
-    int kv_end = kv_start + DEC_CHUNK_SIZE;
-    if (kv_end > seq_len) kv_end = seq_len;
-
-    const int group_size = num_heads / num_kv_heads;
-    const int kv_head_idx = head_idx / group_size;
-    const int64_t kv_head_offset = (int64_t)kv_head_idx * kv_stride_head;
-    const int* block_table_row = block_table_ptr + (int64_t)req_idx * max_blocks_per_seq;
-
-    // Load query [1, head_dim=256] as f32
-    const unsigned short* q_row = query_ptr +
-        (int64_t)req_idx * num_heads * head_dim +
-        (int64_t)head_idx * head_dim;
-
-    simd<float, 64> q0 = sdp_load_64<IS_BF16>(q_row);
-    simd<float, 64> q1 = sdp_load_64<IS_BF16>(q_row + 64);
-    simd<float, 64> q2 = sdp_load_64<IS_BF16>(q_row + 128);
-    simd<float, 64> q3 = sdp_load_64<IS_BF16>(q_row + 192);
-
-    // Online softmax state
-    float max_score = FP32_MIN;
-    float sum_exp = 0.0f;
-    simd<float, 64> acc0(0.0f), acc1(0.0f), acc2(0.0f), acc3(0.0f);
-
-    for (int kv_pos = kv_start; kv_pos < kv_end; kv_pos++) {
-        int block_idx = kv_pos / block_size;
-        int block_offset = kv_pos & (block_size - 1);
-        int block_num = block_table_row[block_idx];
-
-        int64_t kv_base = (int64_t)block_num * kv_stride_block +
-                          (int64_t)block_offset * kv_stride_pos +
-                          kv_head_offset;
-
-        // Load K
-        const unsigned short* k_ptr = kv_cache_ptr + kv_base;
-        simd<float, 64> k0 = sdp_load_64<IS_BF16>(k_ptr);
-        simd<float, 64> k1 = sdp_load_64<IS_BF16>(k_ptr + 64);
-        simd<float, 64> k2 = sdp_load_64<IS_BF16>(k_ptr + 128);
-        simd<float, 64> k3 = sdp_load_64<IS_BF16>(k_ptr + 192);
-
-        float score = sdp_dot256(q0, q1, q2, q3, k0, k1, k2, k3) * attn_scale;
-
-        // Online softmax
-        float new_max = (score > max_score) ? score : max_score;
-        float correction = sdp_esimd_expf(max_score - new_max);
-        acc0 *= correction; acc1 *= correction;
-        acc2 *= correction; acc3 *= correction;
-        sum_exp *= correction;
-
-        float w = sdp_esimd_expf(score - new_max);
-        sum_exp += w;
-        max_score = new_max;
-
-        // Load V
-        const unsigned short* v_ptr = kv_cache_ptr + kv_base + kv_stride_split;
-        acc0 += w * sdp_load_64<IS_BF16>(v_ptr);
-        acc1 += w * sdp_load_64<IS_BF16>(v_ptr + 64);
-        acc2 += w * sdp_load_64<IS_BF16>(v_ptr + 128);
-        acc3 += w * sdp_load_64<IS_BF16>(v_ptr + 192);
-    }
-
-    // Store partials to scratch
-    int scratch_idx = (req_idx * num_heads + head_idx) * num_chunks_per_seq + chunk_id;
-    float* scratch_base = scratch_ptr + scratch_idx * (DEC_SCRATCH_PER_CHUNK / 4);
-
-    // Store max and sum as scalar writes
-    scratch_base[0] = max_score;
-    scratch_base[1] = sum_exp;
-
-    // Store output as bf16 (at offset 2 floats = 8 bytes)
-    unsigned short* out_bf16 = reinterpret_cast<unsigned short*>(scratch_base + 2);
-    sdp_store_64<IS_BF16>(out_bf16, acc0);
-    sdp_store_64<IS_BF16>(out_bf16 + 64, acc1);
-    sdp_store_64<IS_BF16>(out_bf16 + 128, acc2);
-    sdp_store_64<IS_BF16>(out_bf16 + 192, acc3);
-}
+template<uint32_t HD>
+static constexpr int DEC_OPT_SCRATCH_PER_CHUNK = (8 + HD * 2 + 15) & ~15;
 
 
 /* ============================================================
- * DECODE PHASE 2 — Cross-chunk reduction
+ * OPTIMIZED DECODE PHASE 1 — Workgroup-level, SLM-reduced
  *
- * One ESIMD thread per (request, head).
- * Reads all chunk partials, does log-sum-exp correction, stores final output.
- * ============================================================ */
-template<bool IS_BF16>
-ESIMD_INLINE void sdp_paged_decode_phase2(
-    float* __restrict__ scratch_ptr,
-    unsigned short* __restrict__ output_ptr,
-    const int* __restrict__ seq_lens_ptr,
-    int num_heads, int head_dim,
-    int num_chunks_per_seq,
-    nd_item<1>& ndi)
-{
-    const int global_id = ndi.get_global_id(0);
-    const int head_idx = global_id % num_heads;
-    const int req_idx = global_id / num_heads;
-
-    const int seq_len = seq_lens_ptr[req_idx];
-    if (seq_len <= 0) return;
-
-    // Use num_chunks_per_seq from launcher (matches GQA chunk size)
-    int actual_chunks = num_chunks_per_seq;
-    // But clamp to actual sequence length
-    {
-        int seq_chunks = (seq_len + DEC_GQA_CHUNK_SIZE - 1) / DEC_GQA_CHUNK_SIZE;
-        if (seq_chunks < actual_chunks) actual_chunks = seq_chunks;
-    }
-
-    int base_scratch_idx = (req_idx * num_heads + head_idx) * num_chunks_per_seq;
-
-    // Read first chunk
-    float* s0 = scratch_ptr + base_scratch_idx * (DEC_SCRATCH_PER_CHUNK / 4);
-    float global_max = s0[0];
-    float global_sum = s0[1];
-
-    const unsigned short* o0_bf16 = reinterpret_cast<const unsigned short*>(s0 + 2);
-    simd<float, 64> acc0 = sdp_load_64<IS_BF16>(o0_bf16);
-    simd<float, 64> acc1 = sdp_load_64<IS_BF16>(o0_bf16 + 64);
-    simd<float, 64> acc2 = sdp_load_64<IS_BF16>(o0_bf16 + 128);
-    simd<float, 64> acc3 = sdp_load_64<IS_BF16>(o0_bf16 + 192);
-
-    // Merge remaining chunks
-    for (int c = 1; c < actual_chunks; c++) {
-        float* sc = scratch_ptr + (base_scratch_idx + c) * (DEC_SCRATCH_PER_CHUNK / 4);
-        float chunk_max = sc[0];
-        float chunk_sum = sc[1];
-
-        const unsigned short* oc_bf16 = reinterpret_cast<const unsigned short*>(sc + 2);
-        simd<float, 64> c0 = sdp_load_64<IS_BF16>(oc_bf16);
-        simd<float, 64> c1 = sdp_load_64<IS_BF16>(oc_bf16 + 64);
-        simd<float, 64> c2 = sdp_load_64<IS_BF16>(oc_bf16 + 128);
-        simd<float, 64> c3 = sdp_load_64<IS_BF16>(oc_bf16 + 192);
-
-        float new_max = (chunk_max > global_max) ? chunk_max : global_max;
-        float corr_old = sdp_esimd_expf(global_max - new_max);
-        float corr_new = sdp_esimd_expf(chunk_max - new_max);
-
-        acc0 = acc0 * corr_old + c0 * corr_new;
-        acc1 = acc1 * corr_old + c1 * corr_new;
-        acc2 = acc2 * corr_old + c2 * corr_new;
-        acc3 = acc3 * corr_old + c3 * corr_new;
-
-        global_sum = global_sum * corr_old + chunk_sum * corr_new;
-        global_max = new_max;
-    }
-
-    // Normalize
-    if (global_sum > 0.0f) {
-        float inv = 1.0f / global_sum;
-        acc0 *= inv; acc1 *= inv; acc2 *= inv; acc3 *= inv;
-    }
-
-    // Store final output as bf16
-    unsigned short* out_row = output_ptr +
-        (int64_t)req_idx * num_heads * head_dim +
-        (int64_t)head_idx * head_dim;
-
-    sdp_store_64<IS_BF16>(out_row, acc0);
-    sdp_store_64<IS_BF16>(out_row + 64, acc1);
-    sdp_store_64<IS_BF16>(out_row + 128, acc2);
-    sdp_store_64<IS_BF16>(out_row + 192, acc3);
-}
-
-
-/* ============================================================
- * GQA-OPTIMIZED DECODE PHASE 1 — Single-thread, online softmax
+ * Template parameters:
+ *   HD            : head dimension (128 or 256)
+ *   Q_HEAD_PER_T  : Q heads processed per ESIMD thread (4 or 8)
+ *   sp_blk_size   : KV tokens per thread (e.g. 64)
+ *   chunk_size    : total KV tokens per WG chunk (e.g. 256)
+ *   IS_BF16       : true for bf16, false for fp16
  *
- * One thread per (request, kv_head, chunk).
- * Each thread processes DEC_GQA_CHUNK_SIZE KV tokens for 4 Q heads.
- * K/V loaded once, dot product computed for all 4 Q heads → 4× BW savings.
- * Online softmax: single pass loads K+V together.
+ * 3D nd_range:
+ *   global(1, chunk_num * sp_blk_num_per_t,
+ *          batch * headKv * head_groups_per_g)
+ *   local (1, sp_blk_num_per_t, head_groups_per_g)
+ *
+ * Each thread: sp_blk_size KV tokens, Q_HEAD_PER_T Q heads.
+ * K/V loaded once per token, dot product for all Q_HEAD_PER_T heads.
+ * Online softmax within sp_blk, SLM reduction across sp_blks,
+ * then write chunk partial to global scratch.
  * ============================================================ */
-template<bool IS_BF16>
-ESIMD_INLINE void sdp_paged_decode_gqa_phase1(
+template<uint32_t HD, uint32_t NUM_KV_HEADS, uint32_t Q_HEAD_PER_T,
+         uint32_t sp_blk_size, uint32_t chunk_size,
+         uint32_t HEAD_GROUPS_PER_G, bool IS_BF16>
+ESIMD_INLINE void sdp_paged_decode_opt_phase1(
     const unsigned short* __restrict__ query_ptr,
     const unsigned short* __restrict__ kv_cache_ptr,
-    float* __restrict__ scratch_ptr,
+    float* __restrict__ scratch_out,      // [num_chunks, num_heads, HD]
+    float* __restrict__ scratch_max,      // [num_chunks, num_heads]
+    float* __restrict__ scratch_lse,      // [num_chunks, num_heads]
     const int* __restrict__ block_table_ptr,
     const int* __restrict__ seq_lens_ptr,
-    int num_heads, int num_kv_heads, int head_dim,
+    int num_heads,
     int block_size, int max_blocks_per_seq,
     int64_t kv_stride_split, int64_t kv_stride_block,
-    int64_t kv_stride_pos, int64_t kv_stride_head,
     float attn_scale,
     int num_chunks_per_seq,
-    nd_item<1>& ndi)
+    int batch,
+    nd_item<3>& ndi)
 {
-    constexpr int QHT = DEC_GQA_GROUP_SIZE;    // 4
-    constexpr int HD  = 256;
+    using namespace sycl::ext::intel::esimd;
 
-    int tid = ndi.get_global_id(0);
+    constexpr int sp_blk_num_per_t = chunk_size / sp_blk_size;
+    // Compile-time constants matching the reference kernel pattern
+    constexpr int KV_STRIDE_POS = NUM_KV_HEADS * HD;  // stride between tokens (in elements)
+    constexpr int q_head_num_per_kv_head = HEAD_GROUPS_PER_G * Q_HEAD_PER_T;
 
-    int chunk_id = tid % num_chunks_per_seq;
-    int temp = tid / num_chunks_per_seq;
-    int kv_head_idx = temp % num_kv_heads;
-    int req_idx = temp / num_kv_heads;
+    // 3D nd_range (reference pattern):
+    //   global: (1, chunk_num * sp_blk_num_per_t, batch * nkvh * HEAD_GROUPS_PER_G)
+    //   local:  (1, sp_blk_num_per_t, HEAD_GROUPS_PER_G)
+    // Head groups in same WG share L1 cache for K/V reads (critical for 16:1 GQA)
+    int chunk_idx      = ndi.get_group(1);
+    int sp_blk_idx     = ndi.get_local_id(1);
+    int head_group_idx = ndi.get_local_id(2);   // 0 .. HEAD_GROUPS_PER_G-1 (within WG)
+    int kv_wg_idx      = ndi.get_group(2);       // 0 .. batch * nkvh - 1
+    int kv_head_idx    = kv_wg_idx % (int)NUM_KV_HEADS;
+    int req_idx        = kv_wg_idx / (int)NUM_KV_HEADS;
+    int q_head_idx     = kv_head_idx * q_head_num_per_kv_head
+                        + head_group_idx * Q_HEAD_PER_T;
 
-    int group_size = num_heads / num_kv_heads;
-    int q_head_start = kv_head_idx * group_size;
+    if (req_idx >= batch) return;
+
     int seq_len = seq_lens_ptr[req_idx];
 
-    // This thread's KV range
-    int kv_start = chunk_id * DEC_GQA_CHUNK_SIZE;
-    int kv_end = kv_start + DEC_GQA_CHUNK_SIZE;
+    // KV range for this thread
+    int kv_logical_start = chunk_idx * chunk_size + sp_blk_idx * sp_blk_size;
+    int kv_end = kv_logical_start + sp_blk_size;
     if (kv_end > seq_len) kv_end = seq_len;
-    if (kv_start >= seq_len) kv_end = kv_start;
+    if (kv_logical_start >= seq_len) kv_end = kv_logical_start;
 
-    int64_t kv_head_offset = (int64_t)kv_head_idx * kv_stride_head;
-    const int* block_table_row = block_table_ptr + (int64_t)req_idx * max_blocks_per_seq;
+    // SLM layout (reference pattern — includes HEAD_GROUPS_PER_G):
+    //   [0 .. slm_reduce_size)           : output float[hg, sp, Q_HEAD_PER_T, HD]
+    //   [slm_reduce_size .. +slm_max)    : max    float[hg, sp, Q_HEAD_PER_T]
+    //   [+slm_max .. +slm_lse)           : lse    float[hg, sp, Q_HEAD_PER_T]
+    constexpr int slm_reduce_size =
+        HEAD_GROUPS_PER_G * sp_blk_num_per_t * Q_HEAD_PER_T * HD * sizeof(float);
+    constexpr int slm_max_size =
+        HEAD_GROUPS_PER_G * sp_blk_num_per_t * Q_HEAD_PER_T * sizeof(float);
+    constexpr int slm_lse_size =
+        HEAD_GROUPS_PER_G * sp_blk_num_per_t * Q_HEAD_PER_T * sizeof(float);
 
-    // Load Q for all 4 heads (scaled)
-    const unsigned short* q_base = query_ptr +
-        (int64_t)req_idx * num_heads * head_dim;
-
-    simd<float, 64> q0_a = sdp_load_64<IS_BF16>(q_base + (q_head_start + 0) * head_dim) * attn_scale;
-    simd<float, 64> q0_b = sdp_load_64<IS_BF16>(q_base + (q_head_start + 0) * head_dim + 64) * attn_scale;
-    simd<float, 64> q0_c = sdp_load_64<IS_BF16>(q_base + (q_head_start + 0) * head_dim + 128) * attn_scale;
-    simd<float, 64> q0_d = sdp_load_64<IS_BF16>(q_base + (q_head_start + 0) * head_dim + 192) * attn_scale;
-
-    simd<float, 64> q1_a = sdp_load_64<IS_BF16>(q_base + (q_head_start + 1) * head_dim) * attn_scale;
-    simd<float, 64> q1_b = sdp_load_64<IS_BF16>(q_base + (q_head_start + 1) * head_dim + 64) * attn_scale;
-    simd<float, 64> q1_c = sdp_load_64<IS_BF16>(q_base + (q_head_start + 1) * head_dim + 128) * attn_scale;
-    simd<float, 64> q1_d = sdp_load_64<IS_BF16>(q_base + (q_head_start + 1) * head_dim + 192) * attn_scale;
-
-    simd<float, 64> q2_a = sdp_load_64<IS_BF16>(q_base + (q_head_start + 2) * head_dim) * attn_scale;
-    simd<float, 64> q2_b = sdp_load_64<IS_BF16>(q_base + (q_head_start + 2) * head_dim + 64) * attn_scale;
-    simd<float, 64> q2_c = sdp_load_64<IS_BF16>(q_base + (q_head_start + 2) * head_dim + 128) * attn_scale;
-    simd<float, 64> q2_d = sdp_load_64<IS_BF16>(q_base + (q_head_start + 2) * head_dim + 192) * attn_scale;
-
-    simd<float, 64> q3_a = sdp_load_64<IS_BF16>(q_base + (q_head_start + 3) * head_dim) * attn_scale;
-    simd<float, 64> q3_b = sdp_load_64<IS_BF16>(q_base + (q_head_start + 3) * head_dim + 64) * attn_scale;
-    simd<float, 64> q3_c = sdp_load_64<IS_BF16>(q_base + (q_head_start + 3) * head_dim + 128) * attn_scale;
-    simd<float, 64> q3_d = sdp_load_64<IS_BF16>(q_base + (q_head_start + 3) * head_dim + 192) * attn_scale;
-
-    // Online softmax state for 4 heads
-    float mx0 = FP32_MIN, mx1 = FP32_MIN, mx2 = FP32_MIN, mx3 = FP32_MIN;
-    float lse0 = 0, lse1 = 0, lse2 = 0, lse3 = 0;
-    simd<float, 64> a0_a(0), a0_b(0), a0_c(0), a0_d(0);
-    simd<float, 64> a1_a(0), a1_b(0), a1_c(0), a1_d(0);
-    simd<float, 64> a2_a(0), a2_b(0), a2_c(0), a2_d(0);
-    simd<float, 64> a3_a(0), a3_b(0), a3_c(0), a3_d(0);
-
-    for (int kv_pos = kv_start; kv_pos < kv_end; kv_pos++) {
-        int blk_idx = kv_pos / block_size;
-        int blk_off = kv_pos & (block_size - 1);
-        int blk_num = block_table_row[blk_idx];
-
-        int64_t kv_base_off = (int64_t)blk_num * kv_stride_block +
-                              (int64_t)blk_off * kv_stride_pos + kv_head_offset;
-
-        // Load K
-        const unsigned short* k_ptr = kv_cache_ptr + kv_base_off;
-        simd<float, 64> k_a = sdp_load_64<IS_BF16>(k_ptr);
-        simd<float, 64> k_b = sdp_load_64<IS_BF16>(k_ptr + 64);
-        simd<float, 64> k_c = sdp_load_64<IS_BF16>(k_ptr + 128);
-        simd<float, 64> k_d = sdp_load_64<IS_BF16>(k_ptr + 192);
-
-        // QK dot products (scale already in Q)
-        float s0 = sdp_dot256(q0_a, q0_b, q0_c, q0_d, k_a, k_b, k_c, k_d);
-        float s1 = sdp_dot256(q1_a, q1_b, q1_c, q1_d, k_a, k_b, k_c, k_d);
-        float s2 = sdp_dot256(q2_a, q2_b, q2_c, q2_d, k_a, k_b, k_c, k_d);
-        float s3 = sdp_dot256(q3_a, q3_b, q3_c, q3_d, k_a, k_b, k_c, k_d);
-
-        // Load V
-        const unsigned short* v_ptr = kv_cache_ptr + kv_base_off + kv_stride_split;
-        simd<float, 64> v_a = sdp_load_64<IS_BF16>(v_ptr);
-        simd<float, 64> v_b = sdp_load_64<IS_BF16>(v_ptr + 64);
-        simd<float, 64> v_c = sdp_load_64<IS_BF16>(v_ptr + 128);
-        simd<float, 64> v_d = sdp_load_64<IS_BF16>(v_ptr + 192);
-
-        // Online softmax + V accumulation for each head
-        // Head 0
-        float old_mx0 = mx0;
-        if (s0 > mx0) mx0 = s0;
-        float corr0 = sdp_esimd_expf(old_mx0 - mx0);
-        float w0 = sdp_esimd_expf(s0 - mx0);
-        a0_a = a0_a * corr0 + v_a * w0; a0_b = a0_b * corr0 + v_b * w0;
-        a0_c = a0_c * corr0 + v_c * w0; a0_d = a0_d * corr0 + v_d * w0;
-        lse0 = lse0 * corr0 + w0;
-
-        // Head 1
-        float old_mx1 = mx1;
-        if (s1 > mx1) mx1 = s1;
-        float corr1 = sdp_esimd_expf(old_mx1 - mx1);
-        float w1 = sdp_esimd_expf(s1 - mx1);
-        a1_a = a1_a * corr1 + v_a * w1; a1_b = a1_b * corr1 + v_b * w1;
-        a1_c = a1_c * corr1 + v_c * w1; a1_d = a1_d * corr1 + v_d * w1;
-        lse1 = lse1 * corr1 + w1;
-
-        // Head 2
-        float old_mx2 = mx2;
-        if (s2 > mx2) mx2 = s2;
-        float corr2 = sdp_esimd_expf(old_mx2 - mx2);
-        float w2 = sdp_esimd_expf(s2 - mx2);
-        a2_a = a2_a * corr2 + v_a * w2; a2_b = a2_b * corr2 + v_b * w2;
-        a2_c = a2_c * corr2 + v_c * w2; a2_d = a2_d * corr2 + v_d * w2;
-        lse2 = lse2 * corr2 + w2;
-
-        // Head 3
-        float old_mx3 = mx3;
-        if (s3 > mx3) mx3 = s3;
-        float corr3 = sdp_esimd_expf(old_mx3 - mx3);
-        float w3 = sdp_esimd_expf(s3 - mx3);
-        a3_a = a3_a * corr3 + v_a * w3; a3_b = a3_b * corr3 + v_b * w3;
-        a3_c = a3_c * corr3 + v_c * w3; a3_d = a3_d * corr3 + v_d * w3;
-        lse3 = lse3 * corr3 + w3;
+    // Init SLM if we have multiple threads to reduce (sp_blks or head_groups)
+    if constexpr (sp_blk_num_per_t > 1) {
+        slm_init(slm_reduce_size + slm_max_size + slm_lse_size);
     }
 
-    // Write to global scratch for all 4 Q heads
-    float maxes[4] = {mx0, mx1, mx2, mx3};
-    float lses[4] = {lse0, lse1, lse2, lse3};
+    const int* block_table_row = block_table_ptr + (int64_t)req_idx * max_blocks_per_seq;
 
+    // Load Q — reference pattern: single load + scale
+    const unsigned short* q_base = query_ptr +
+        (int64_t)req_idx * num_heads * HD;
+
+    simd<fp16, Q_HEAD_PER_T * HD> qIn;
+    if constexpr (!IS_BF16) {
+        // fp16: direct block_load (reference pattern — no conversion)
+        const fp16* q_fp16 = reinterpret_cast<const fp16*>(
+            q_base + (int64_t)q_head_idx * HD);
+        qIn = block_load<fp16, Q_HEAD_PER_T * HD>(q_fp16);
+        qIn = qIn * attn_scale;
+    } else {
+        // bf16: load → float → scale → fp16
+        #pragma unroll
+        for (int h = 0; h < (int)Q_HEAD_PER_T; h++) {
+            if constexpr (HD == 128) {
+                simd<float, 64> q0 = sdp_load_bf16_64(q_base + (q_head_idx + h) * HD);
+                simd<float, 64> q1 = sdp_load_bf16_64(q_base + (q_head_idx + h) * HD + 64);
+                q0 *= attn_scale; q1 *= attn_scale;
+                qIn.template select<64, 1>(h * HD) = q0;
+                qIn.template select<64, 1>(h * HD + 64) = q1;
+            } else {
+                simd<float, 64> q0 = sdp_load_bf16_64(q_base + (q_head_idx + h) * HD) * attn_scale;
+                simd<float, 64> q1 = sdp_load_bf16_64(q_base + (q_head_idx + h) * HD + 64) * attn_scale;
+                simd<float, 64> q2 = sdp_load_bf16_64(q_base + (q_head_idx + h) * HD + 128) * attn_scale;
+                simd<float, 64> q3 = sdp_load_bf16_64(q_base + (q_head_idx + h) * HD + 192) * attn_scale;
+                qIn.template select<64, 1>(h * HD) = q0;
+                qIn.template select<64, 1>(h * HD + 64) = q1;
+                qIn.template select<64, 1>(h * HD + 128) = q2;
+                qIn.template select<64, 1>(h * HD + 192) = q3;
+            }
+        }
+    }
+
+    // Online softmax state
+    simd<float, Q_HEAD_PER_T> maxKq          = FP32_MIN;
+    simd<float, Q_HEAD_PER_T> old_maxKq      = FP32_MIN;
+    simd<float, Q_HEAD_PER_T> max_correction = FP32_MIN;
+    simd<float, Q_HEAD_PER_T> lse            = 0;
+    simd<float, Q_HEAD_PER_T * HD> output    = 0;
+
+    // ---- Paged inner loop (compile-time stride, no while loop) ----
+    // block_size >= sp_blk_size guaranteed, so no block boundary within an sp_blk.
+    // Single block lookup per sp_blk (reference pattern).
+    int kv_start = kv_logical_start;
+    int valid_t = kv_end - kv_start;
+
+    int blk_idx = kv_start / block_size;
+    int blk_off = kv_start & (block_size - 1);
+    int blk_num = block_table_row[blk_idx];
+
+    // Compute K and V base pointers (ONLY int64 ops, done once)
+    int head_off = kv_head_idx * (int)HD;
+    const unsigned short* k_base = kv_cache_ptr
+        + (int64_t)blk_num * kv_stride_block + head_off;
+    const unsigned short* v_base = k_base + (int)kv_stride_split;
+
+    // Compile-time stride: KV_STRIDE_POS = NUM_KV_HEADS * HD (matches reference)
+    // Starting offset within block, using compile-time stride
+    int kv_off = blk_off * KV_STRIDE_POS;
+
+    for (int t = 0; t < valid_t; t++, kv_off += KV_STRIDE_POS) {
+        // Load K and V together (V load hides behind K dot product ALU)
+        const unsigned short* k_ptr = k_base + kv_off;
+        const unsigned short* v_ptr = v_base + kv_off;
+        simd<fp16, HD> kIn;
+        simd<fp16, HD> vIn;
+        if constexpr (!IS_BF16) {
+            kIn = block_load<fp16, HD>(reinterpret_cast<const fp16*>(k_ptr));
+            vIn = block_load<fp16, HD>(reinterpret_cast<const fp16*>(v_ptr));
+        } else if constexpr (HD == 128) {
+            simd<float, 64> k0 = sdp_load_bf16_64(k_ptr);
+            simd<float, 64> k1 = sdp_load_bf16_64(k_ptr + 64);
+            simd<float, 64> v0 = sdp_load_bf16_64(v_ptr);
+            simd<float, 64> v1 = sdp_load_bf16_64(v_ptr + 64);
+            kIn.template select<64, 1>(0) = k0;
+            kIn.template select<64, 1>(64) = k1;
+            vIn.template select<64, 1>(0) = v0;
+            vIn.template select<64, 1>(64) = v1;
+        } else {
+            simd<float, 64> k0 = sdp_load_bf16_64(k_ptr);
+            simd<float, 64> k1 = sdp_load_bf16_64(k_ptr + 64);
+            simd<float, 64> k2 = sdp_load_bf16_64(k_ptr + 128);
+            simd<float, 64> k3 = sdp_load_bf16_64(k_ptr + 192);
+            simd<float, 64> v0 = sdp_load_bf16_64(v_ptr);
+            simd<float, 64> v1 = sdp_load_bf16_64(v_ptr + 64);
+            simd<float, 64> v2 = sdp_load_bf16_64(v_ptr + 128);
+            simd<float, 64> v3 = sdp_load_bf16_64(v_ptr + 192);
+            kIn.template select<64, 1>(0) = k0;
+            kIn.template select<64, 1>(64) = k1;
+            kIn.template select<64, 1>(128) = k2;
+            kIn.template select<64, 1>(192) = k3;
+            vIn.template select<64, 1>(0) = v0;
+            vIn.template select<64, 1>(64) = v1;
+            vIn.template select<64, 1>(128) = v2;
+            vIn.template select<64, 1>(192) = v3;
+        }
+
+        // QK dot products
+        simd<float, Q_HEAD_PER_T> kq_out;
+        #pragma unroll
+        for (int h = 0; h < (int)Q_HEAD_PER_T; h++) {
+            kq_out[h] = sycl::ext::intel::esimd::detail::sum<float, fp16, HD>(
+                qIn.template select<HD, 1>(h * HD) * kIn);
+        }
+
+        // Online softmax
+        old_maxKq = maxKq;
+        maxKq = __ESIMD_NS::max<float, Q_HEAD_PER_T, float>(kq_out, old_maxKq);
+        kq_out = kq_out - maxKq;
+        kq_out = __ESIMD_NS::exp2<float, Q_HEAD_PER_T, float>(
+            kq_out * sycl::ext::intel::esimd::detail::log2e);
+
+        if (t >= 1) {
+            max_correction = old_maxKq - maxKq;
+            max_correction = __ESIMD_NS::exp2<float, Q_HEAD_PER_T, float>(
+                max_correction * sycl::ext::intel::esimd::detail::log2e);
+            #pragma unroll
+            for (int h = 0; h < (int)Q_HEAD_PER_T; h++) {
+                output.template select<HD, 1>(h * HD) =
+                    output.template select<HD, 1>(h * HD) * max_correction[h];
+            }
+            lse = lse * max_correction;
+        }
+        lse = lse + kq_out;
+
+        // V accumulation (V already loaded — no memory stall)
+        #pragma unroll
+        for (int h = 0; h < (int)Q_HEAD_PER_T; h++) {
+            float w = kq_out[h];
+            simd<float, HD> vf = vIn * w;
+            output.template select<HD, 1>(h * HD) =
+                output.template select<HD, 1>(h * HD) + vf;
+        }
+    }
+
+    // =========================================================
+    // SLM reduction (only when sp_blk_num_per_t > 1)
+    // =========================================================
+    if constexpr (sp_blk_num_per_t > 1) {
+        // Store this sp_blk's partial result into SLM
+        // SLM index: head_group_idx * sp_blk_num_per_t + sp_blk_idx (reference pattern)
+        int idx_slm = head_group_idx * sp_blk_num_per_t + sp_blk_idx;
+        slm_block_store<float, Q_HEAD_PER_T>(
+            slm_reduce_size + idx_slm * Q_HEAD_PER_T * sizeof(float), maxKq);
+        slm_block_store<float, Q_HEAD_PER_T>(
+            slm_reduce_size + slm_max_size + idx_slm * Q_HEAD_PER_T * sizeof(float), lse);
+
+        // Store output as single large SLM store (matching reference pattern)
+        slm_block_store<float, Q_HEAD_PER_T * HD>(
+            idx_slm * Q_HEAD_PER_T * HD * sizeof(float), output);
+
+        output = 0;
+        barrier();
+
+        // Intra-chunk reduce: sp_blk_idx==0 thread reduces all sp_blks (within its head_group)
+        if (sp_blk_idx == 0) {
+            int slm_r_h_offset = (head_group_idx * sp_blk_num_per_t) * Q_HEAD_PER_T * sizeof(float);
+            int slm_r_o_h_offset = (head_group_idx * sp_blk_num_per_t) * Q_HEAD_PER_T * HD * sizeof(float);
+
+            simd<float, Q_HEAD_PER_T> max_final = FP32_MIN;
+            simd<float, Q_HEAD_PER_T> lse_final = 0;
+
+            // Pass 1: find global max
+            for (int c_idx = 0; c_idx < sp_blk_num_per_t; c_idx++) {
+                simd<float, Q_HEAD_PER_T> cur_max = slm_block_load<float, Q_HEAD_PER_T>(
+                    slm_reduce_size + slm_r_h_offset + c_idx * Q_HEAD_PER_T * sizeof(float));
+                max_final = __ESIMD_NS::max<float, Q_HEAD_PER_T, float>(cur_max, max_final);
+            }
+
+            // Pass 2: accumulate with correction
+            for (int c_idx = 0; c_idx < sp_blk_num_per_t; c_idx++) {
+                simd<float, Q_HEAD_PER_T> cur_max = slm_block_load<float, Q_HEAD_PER_T>(
+                    slm_reduce_size + slm_r_h_offset + c_idx * Q_HEAD_PER_T * sizeof(float));
+                simd<float, Q_HEAD_PER_T> cur_lse = slm_block_load<float, Q_HEAD_PER_T>(
+                    slm_reduce_size + slm_max_size + slm_r_h_offset
+                    + c_idx * Q_HEAD_PER_T * sizeof(float));
+                simd<float, Q_HEAD_PER_T> correction =
+                    __ESIMD_NS::exp2<float, Q_HEAD_PER_T, float>(
+                        (cur_max - max_final) * sycl::ext::intel::esimd::detail::log2e);
+                lse_final = lse_final + cur_lse * correction;
+
+                #pragma unroll
+                for (int h = 0; h < (int)Q_HEAD_PER_T; h++) {
+                    float corr_h = correction[h];
+                    // Single HD-sized SLM load per head (matching reference pattern)
+                    simd<float, HD> cur_o = slm_block_load<float, HD>(
+                        slm_r_o_h_offset + (c_idx * Q_HEAD_PER_T + h) * HD * sizeof(float));
+                    output.template select<HD, 1>(h * HD) =
+                        output.template select<HD, 1>(h * HD) + cur_o * corr_h;
+                }
+            }
+
+            // Write chunk result to global scratch
+            maxKq = max_final;
+            lse = lse_final;
+        } else {
+            return;  // Only sp_blk_idx==0 writes global scratch
+        }
+    }
+
+    // Write to global scratch as fp32
+    // Layout: scratch_*[(req_idx * num_chunks + chunk_idx) * num_heads + head_idx]
+    int scratch_req_base = req_idx * num_chunks_per_seq * num_heads;
     #pragma unroll
-    for (int h = 0; h < QHT; h++) {
-        int scratch_idx = (req_idx * num_heads + q_head_start + h) * num_chunks_per_seq + chunk_id;
-        float* scratch_base = scratch_ptr + scratch_idx * (DEC_SCRATCH_PER_CHUNK / 4);
-        scratch_base[0] = maxes[h];
-        scratch_base[1] = lses[h];
+    for (int h = 0; h < (int)Q_HEAD_PER_T; h++) {
+        int scratch_idx = scratch_req_base + chunk_idx * num_heads + (q_head_idx + h);
+        scratch_max[scratch_idx] = maxKq[h];
+        scratch_lse[scratch_idx] = lse[h];
+        float* out_base = scratch_out + (int64_t)scratch_idx * HD;
+        // Single HD-sized global store per head (matching reference pattern)
+        block_store<float, HD>(out_base, output.template select<HD, 1>(h * HD));
+    }
+}
 
-        unsigned short* out_bf16 = reinterpret_cast<unsigned short*>(scratch_base + 2);
-        if (h == 0) { sdp_store_64<IS_BF16>(out_bf16, a0_a); sdp_store_64<IS_BF16>(out_bf16 + 64, a0_b);
-                      sdp_store_64<IS_BF16>(out_bf16 + 128, a0_c); sdp_store_64<IS_BF16>(out_bf16 + 192, a0_d); }
-        if (h == 1) { sdp_store_64<IS_BF16>(out_bf16, a1_a); sdp_store_64<IS_BF16>(out_bf16 + 64, a1_b);
-                      sdp_store_64<IS_BF16>(out_bf16 + 128, a1_c); sdp_store_64<IS_BF16>(out_bf16 + 192, a1_d); }
-        if (h == 2) { sdp_store_64<IS_BF16>(out_bf16, a2_a); sdp_store_64<IS_BF16>(out_bf16 + 64, a2_b);
-                      sdp_store_64<IS_BF16>(out_bf16 + 128, a2_c); sdp_store_64<IS_BF16>(out_bf16 + 192, a2_d); }
-        if (h == 3) { sdp_store_64<IS_BF16>(out_bf16, a3_a); sdp_store_64<IS_BF16>(out_bf16 + 64, a3_b);
-                      sdp_store_64<IS_BF16>(out_bf16 + 128, a3_c); sdp_store_64<IS_BF16>(out_bf16 + 192, a3_d); }
+
+/* ============================================================
+ * OPTIMIZED DECODE PHASE 2 — Cross-chunk reduction
+ *
+ * Template parameters:
+ *   HD              : head dimension (128 or 256)
+ *   HEADS_PER_THREAD: Q heads per ESIMD thread (16 for HD=128, 4 for HD=256)
+ *   IS_BF16         : true for bf16, false for fp16
+ *
+ * Each workitem handles HEADS_PER_THREAD consecutive Q heads.
+ * Global threads: batch * num_heads / HEADS_PER_THREAD.
+ * Two-pass: global max across chunks, then accumulate with correction.
+ * ============================================================ */
+template<uint32_t HD, uint32_t HEADS_PER_THREAD, bool IS_BF16>
+ESIMD_INLINE void sdp_paged_decode_opt_phase2(
+    float* __restrict__ scratch_out,      // [num_chunks, num_heads, HD]
+    float* __restrict__ scratch_max,      // [num_chunks, num_heads]
+    float* __restrict__ scratch_lse,      // [num_chunks, num_heads]
+    unsigned short* __restrict__ output_ptr,
+    const int* __restrict__ seq_lens_ptr,
+    int num_heads,
+    int num_chunks_per_seq,
+    int batch,
+    nd_item<1>& ndi)
+{
+    using namespace sycl::ext::intel::esimd;
+
+    int global_id = ndi.get_global_id(0);
+    int q_head_start = global_id * HEADS_PER_THREAD;
+    int req_idx = q_head_start / num_heads;
+    q_head_start = q_head_start % num_heads;
+
+    if (req_idx >= batch) return;
+
+    int seq_len = seq_lens_ptr[req_idx];
+    if (seq_len <= 0) return;
+
+    int actual_chunks = num_chunks_per_seq;
+
+    // Scratch layout: scratch_*[chunk * num_heads + head]
+    // For batch>1: scratch is per-request, offset by req_idx * num_chunks_per_seq * num_heads
+    int scratch_req_offset = req_idx * num_chunks_per_seq * num_heads;
+
+    if constexpr (HD == 128 && HEADS_PER_THREAD == 16) {
+        // Reference-matching pattern: process 16 heads simultaneously
+        // GRF: reduce_final = simd<fp32, 128*16> = 8KB, fits in 16KB doubleGRF
+        simd<float, HEADS_PER_THREAD> max_final = FP32_MIN;
+        simd<float, HD * HEADS_PER_THREAD> reduce_final = 0;
+        simd<float, HEADS_PER_THREAD> lse_final = 0;
+
+        int base_out = q_head_start * HD;
+        int base_lsmax = q_head_start;
+
+        // Pass 1: global max across all chunks for these 16 heads
+        for (int ck = 0; ck < actual_chunks; ck++) {
+            simd<float, HEADS_PER_THREAD> cur_max =
+                block_load<float, HEADS_PER_THREAD>(
+                    scratch_max + scratch_req_offset + base_lsmax + ck * num_heads);
+            max_final = __ESIMD_NS::max<float, HEADS_PER_THREAD, float>(cur_max, max_final);
+        }
+
+        // Pass 2: weighted accumulate
+        for (int ck = 0; ck < actual_chunks; ck++) {
+            int32_t out_ck = base_out + (scratch_req_offset + ck * num_heads) * HD;
+            int32_t lsmax_ck = base_lsmax + scratch_req_offset + ck * num_heads;
+
+            simd<float, HEADS_PER_THREAD> cur_max =
+                block_load<float, HEADS_PER_THREAD>(scratch_max + lsmax_ck);
+            simd<float, HEADS_PER_THREAD> cur_lse =
+                block_load<float, HEADS_PER_THREAD>(scratch_lse + lsmax_ck);
+            simd<float, HEADS_PER_THREAD> correction =
+                __ESIMD_NS::pow<float, HEADS_PER_THREAD, float>(2.718f, cur_max - max_final);
+            lse_final = lse_final + cur_lse * correction;
+
+            #pragma unroll
+            for (int j = 0; j < (int)HEADS_PER_THREAD; j++) {
+                simd<float, HD> cur_o = block_load<float, HD>(scratch_out + out_ck + j * HD);
+                float corr_j = correction[j];
+                reduce_final.template select<HD, 1>(HD * j) =
+                    cur_o * corr_j +
+                    reduce_final.template select<HD, 1>(HD * j);
+            }
+        }
+
+        // Normalize by lse and write fp16/bf16 final output
+        unsigned short* out_base = output_ptr +
+            (int64_t)req_idx * num_heads * HD + (int64_t)q_head_start * HD;
+        #pragma unroll
+        for (int i = 0; i < (int)HEADS_PER_THREAD; i++) {
+            reduce_final.template select<HD, 1>(i * HD) =
+                reduce_final.template select<HD, 1>(i * HD) / lse_final[i];
+            sdp_store_64<IS_BF16>(out_base + i * HD,
+                reduce_final.template select<64, 1>(i * HD));
+            sdp_store_64<IS_BF16>(out_base + i * HD + 64,
+                reduce_final.template select<64, 1>(i * HD + 64));
+        }
+    } else {
+        // HD=256 or small HEADS_PER_THREAD: per-head loop with HD-sized loads
+        #pragma unroll
+        for (int j = 0; j < (int)HEADS_PER_THREAD; j++) {
+            int head_idx = q_head_start + j;
+            int base_idx = scratch_req_offset + head_idx;
+
+            // Read first chunk
+            float global_max = scratch_max[base_idx];
+            float global_sum = scratch_lse[base_idx];
+            float* out_base0 = scratch_out + (int64_t)base_idx * HD;
+
+            simd<float, HD> acc;
+            if constexpr (HD == 128) {
+                acc = block_load<float, HD>(out_base0);
+            } else {
+                // HD=256: load in 2 halves
+                acc.template select<128, 1>(0) = block_load<float, 128>(out_base0);
+                acc.template select<128, 1>(128) = block_load<float, 128>(out_base0 + 128);
+            }
+
+            // Merge remaining chunks
+            for (int c = 1; c < actual_chunks; c++) {
+                int idx = scratch_req_offset + c * num_heads + head_idx;
+                float chunk_max = scratch_max[idx];
+                float chunk_sum = scratch_lse[idx];
+
+                if (chunk_sum == 0.0f) continue;
+
+                float* out_base_c = scratch_out + (int64_t)idx * HD;
+                simd<float, HD> cur;
+                if constexpr (HD == 128) {
+                    cur = block_load<float, HD>(out_base_c);
+                } else {
+                    cur.template select<128, 1>(0) = block_load<float, 128>(out_base_c);
+                    cur.template select<128, 1>(128) = block_load<float, 128>(out_base_c + 128);
+                }
+
+                float new_max = (chunk_max > global_max) ? chunk_max : global_max;
+                float corr_old = sdp_esimd_expf(global_max - new_max);
+                float corr_new = sdp_esimd_expf(chunk_max - new_max);
+
+                acc = acc * corr_old + cur * corr_new;
+                global_sum = global_sum * corr_old + chunk_sum * corr_new;
+                global_max = new_max;
+            }
+
+            // Normalize
+            if (global_sum > 0.0f) {
+                acc *= (1.0f / global_sum);
+            }
+
+            // Store final output as fp16/bf16
+            unsigned short* out_row = output_ptr +
+                (int64_t)req_idx * num_heads * HD +
+                (int64_t)head_idx * HD;
+
+            sdp_store_64<IS_BF16>(out_row, acc.template select<64, 1>(0));
+            sdp_store_64<IS_BF16>(out_row + 64, acc.template select<64, 1>(64));
+            if constexpr (HD == 256) {
+                sdp_store_64<IS_BF16>(out_row + 128, acc.template select<64, 1>(128));
+                sdp_store_64<IS_BF16>(out_row + 192, acc.template select<64, 1>(192));
+            }
+        }
     }
 }
 

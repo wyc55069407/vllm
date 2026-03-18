@@ -518,58 +518,156 @@ at::Tensor esimd_sdp_paged(
     // Determine decode vs prefill
     bool is_decode = (num_tokens == batch);
 
-    if (is_decode && hd == 256) {
-        // ===== Two-phase decode kernel with GQA optimization =====
+    if (is_decode && hd == 128) {
+        // ===== Optimized two-phase decode for HD=128 =====
+        // Supports GQA ratios: 16:1 (Q_HEAD_PER_T=8), 8:1 (Q_HEAD_PER_T=8), 4:1 (Q_HEAD_PER_T=4)
+        int gqa_ratio = nh / nkvh;
+
+        constexpr int DEC128_SP_BLK = 64;
+        constexpr int DEC128_CHUNK = 256;
+        constexpr int DEC128_SP_PER_T = DEC128_CHUNK / DEC128_SP_BLK;  // 4
+
         int max_sl = (int)max_seq_len;
-        int num_chunks = (max_sl + DEC_GQA_CHUNK_SIZE - 1) / DEC_GQA_CHUNK_SIZE;
+        int num_chunks = (max_sl + DEC128_CHUNK - 1) / DEC128_CHUNK;
 
-        // Allocate scratch buffer for phase1 partials
-        int64_t scratch_elements = (int64_t)batch * nh * num_chunks * (DEC_SCRATCH_PER_CHUNK / 4);
-        auto scratch = at::empty({scratch_elements}, query.options().dtype(at::kFloat));
-        auto* scratch_ptr = scratch.data_ptr<float>();
+        // Separate fp32 scratch buffers — per-request scratch for batch>1 correctness
+        int64_t scratch_out_elems = (int64_t)batch * num_chunks * nh * 128;  // HD=128
+        int64_t scratch_sc_elems = (int64_t)batch * num_chunks * nh;
+        auto scratch_out_t = at::empty({scratch_out_elems}, query.options().dtype(at::kFloat));
+        auto scratch_max_t = at::empty({scratch_sc_elems}, query.options().dtype(at::kFloat));
+        auto scratch_lse_t = at::empty({scratch_sc_elems}, query.options().dtype(at::kFloat));
+        auto* s_out = scratch_out_t.data_ptr<float>();
+        auto* s_max = scratch_max_t.data_ptr<float>();
+        auto* s_lse = scratch_lse_t.data_ptr<float>();
 
-        int64_t p1_threads = (int64_t)batch * nkvh * num_chunks;
-        sycl::nd_range<1> p1_range(sycl::range<1>(p1_threads), sycl::range<1>(1));
-
-        int64_t p2_threads = (int64_t)batch * nh;
+        // Phase2: one thread per HEADS_PER_THREAD=4 heads
+        constexpr int P2_HPT_128 = 4;
+        int64_t p2_threads = (int64_t)batch * nh / P2_HPT_128;
         sycl::nd_range<1> p2_range(sycl::range<1>(p2_threads), sycl::range<1>(1));
 
-        if (is_bf16) {
+        // Lambda to dispatch phase1 + phase2 with compile-time NKVH, QHT, HGPG
+        auto dispatch_128 = [&]<int NKVH, int QHT, int HGPG, bool BF16>() {
+            int64_t global_dim2 = (int64_t)batch * nkvh * HGPG;
+            sycl::range<3> global_p1(1, (int64_t)num_chunks * DEC128_SP_PER_T, global_dim2);
+            sycl::range<3> local_p1(1, DEC128_SP_PER_T, HGPG);
+
             dpcpp_queue.submit([&](sycl::handler& cgh) {
-                cgh.parallel_for(p1_range, [=](sycl::nd_item<1> ndi) SYCL_ESIMD_KERNEL {
-                    sdp_paged_decode_gqa_phase1<true>(
-                        query_us, kv_cache_us, scratch_ptr,
+                cgh.parallel_for(sycl::nd_range<3>(global_p1, local_p1),
+                    [=](sycl::nd_item<3> ndi) SYCL_ESIMD_KERNEL {
+                    sdp_paged_decode_opt_phase1<128, NKVH, QHT, DEC128_SP_BLK, DEC128_CHUNK, HGPG, BF16>(
+                        query_us, kv_cache_us, s_out, s_max, s_lse,
                         block_table_i, seq_lens_i,
-                        nh, nkvh, hd, bs, mbps,
-                        kv_s0, kv_s1, kv_s2, kv_s3,
-                        as_f, num_chunks, ndi);
+                        nh, bs, mbps,
+                        kv_s0, kv_s1,
+                        as_f, num_chunks, batch, ndi);
                 });
             });
             dpcpp_queue.submit([&](sycl::handler& cgh) {
                 cgh.parallel_for(p2_range, [=](sycl::nd_item<1> ndi) SYCL_ESIMD_KERNEL {
-                    sdp_paged_decode_phase2<true>(
-                        scratch_ptr, output_us, seq_lens_i,
-                        nh, hd, num_chunks, ndi);
+                    sdp_paged_decode_opt_phase2<128, P2_HPT_128, BF16>(
+                        s_out, s_max, s_lse, output_us, seq_lens_i,
+                        nh, num_chunks, batch, ndi);
                 });
             });
+        };
+
+        if (gqa_ratio >= 16) {
+            // 16:1 GQA (e.g. 32Q/2KV): QHT=8, HGPG=2
+            if (nkvh == 2) {
+                if (is_bf16) dispatch_128.template operator()<2, 8, 2, true>();
+                else         dispatch_128.template operator()<2, 8, 2, false>();
+            } else {
+                // Generic 16:1 with different nkvh — use nkvh=4 as fallback
+                if (is_bf16) dispatch_128.template operator()<4, 8, 2, true>();
+                else         dispatch_128.template operator()<4, 8, 2, false>();
+            }
+        } else if (gqa_ratio >= 8) {
+            // 8:1 GQA (e.g. 32Q/4KV): QHT=8, HGPG=1
+            if (is_bf16) dispatch_128.template operator()<4, 8, 1, true>();
+            else         dispatch_128.template operator()<4, 8, 1, false>();
+        } else if (gqa_ratio >= 4) {
+            // 4:1 GQA: QHT=4, HGPG=1
+            if (is_bf16) dispatch_128.template operator()<4, 4, 1, true>();
+            else         dispatch_128.template operator()<4, 4, 1, false>();
         } else {
-            dpcpp_queue.submit([&](sycl::handler& cgh) {
-                cgh.parallel_for(p1_range, [=](sycl::nd_item<1> ndi) SYCL_ESIMD_KERNEL {
-                    sdp_paged_decode_gqa_phase1<false>(
-                        query_us, kv_cache_us, scratch_ptr,
-                        block_table_i, seq_lens_i,
-                        nh, nkvh, hd, bs, mbps,
-                        kv_s0, kv_s1, kv_s2, kv_s3,
-                        as_f, num_chunks, ndi);
+            // GQA < 4: fall back to scalar
+            goto scalar_fallback;
+        }
+    } else if (is_decode && hd == 256) {
+        // ===== Optimized two-phase decode for HD=256 =====
+        int gqa_ratio = nh / nkvh;
+
+        if (gqa_ratio >= 4) {
+            constexpr int QHT = 4;
+            constexpr int DEC256_SP_BLK = 64;
+            constexpr int DEC256_CHUNK = 64;
+            constexpr int DEC256_SP_PER_T = DEC256_CHUNK / DEC256_SP_BLK;  // 1
+
+            int max_sl = (int)max_seq_len;
+            int num_chunks = (max_sl + DEC256_CHUNK - 1) / DEC256_CHUNK;
+
+            // Separate fp32 scratch buffers — per-request scratch for batch>1
+            int64_t scratch_out_elems = (int64_t)batch * num_chunks * nh * 256;  // HD=256
+            int64_t scratch_sc_elems = (int64_t)batch * num_chunks * nh;
+            auto scratch_out_t = at::empty({scratch_out_elems}, query.options().dtype(at::kFloat));
+            auto scratch_max_t = at::empty({scratch_sc_elems}, query.options().dtype(at::kFloat));
+            auto scratch_lse_t = at::empty({scratch_sc_elems}, query.options().dtype(at::kFloat));
+            auto* s_out = scratch_out_t.data_ptr<float>();
+            auto* s_max = scratch_max_t.data_ptr<float>();
+            auto* s_lse = scratch_lse_t.data_ptr<float>();
+
+            int head_groups_per_g = gqa_ratio / QHT;
+            int64_t global_dim2 = (int64_t)batch * nkvh * head_groups_per_g;
+            sycl::range<3> global_p1(1, (int64_t)num_chunks * DEC256_SP_PER_T, global_dim2);
+            sycl::range<3> local_p1(1, DEC256_SP_PER_T, 1);
+
+            constexpr int P2_HPT_256 = 4;
+            int64_t p2_threads = (int64_t)batch * nh / P2_HPT_256;
+            sycl::nd_range<1> p2_range(sycl::range<1>(p2_threads), sycl::range<1>(1));
+
+            // HD=256 always uses HGPG=1 (4:1 GQA, QHT=4 covers all Q heads per KV head)
+            if (is_bf16) {
+                dpcpp_queue.submit([&](sycl::handler& cgh) {
+                    cgh.parallel_for(sycl::nd_range<3>(global_p1, local_p1),
+                        [=](sycl::nd_item<3> ndi) SYCL_ESIMD_KERNEL {
+                        sdp_paged_decode_opt_phase1<256, 4, QHT, DEC256_SP_BLK, DEC256_CHUNK, 1, true>(
+                            query_us, kv_cache_us, s_out, s_max, s_lse,
+                            block_table_i, seq_lens_i,
+                            nh, bs, mbps,
+                            kv_s0, kv_s1,
+                            as_f, num_chunks, batch, ndi);
+                    });
                 });
-            });
-            dpcpp_queue.submit([&](sycl::handler& cgh) {
-                cgh.parallel_for(p2_range, [=](sycl::nd_item<1> ndi) SYCL_ESIMD_KERNEL {
-                    sdp_paged_decode_phase2<false>(
-                        scratch_ptr, output_us, seq_lens_i,
-                        nh, hd, num_chunks, ndi);
+                dpcpp_queue.submit([&](sycl::handler& cgh) {
+                    cgh.parallel_for(p2_range, [=](sycl::nd_item<1> ndi) SYCL_ESIMD_KERNEL {
+                        sdp_paged_decode_opt_phase2<256, P2_HPT_256, true>(
+                            s_out, s_max, s_lse, output_us, seq_lens_i,
+                            nh, num_chunks, batch, ndi);
+                    });
                 });
-            });
+            } else {
+                dpcpp_queue.submit([&](sycl::handler& cgh) {
+                    cgh.parallel_for(sycl::nd_range<3>(global_p1, local_p1),
+                        [=](sycl::nd_item<3> ndi) SYCL_ESIMD_KERNEL {
+                        sdp_paged_decode_opt_phase1<256, 4, QHT, DEC256_SP_BLK, DEC256_CHUNK, 1, false>(
+                            query_us, kv_cache_us, s_out, s_max, s_lse,
+                            block_table_i, seq_lens_i,
+                            nh, bs, mbps,
+                            kv_s0, kv_s1,
+                            as_f, num_chunks, batch, ndi);
+                    });
+                });
+                dpcpp_queue.submit([&](sycl::handler& cgh) {
+                    cgh.parallel_for(p2_range, [=](sycl::nd_item<1> ndi) SYCL_ESIMD_KERNEL {
+                        sdp_paged_decode_opt_phase2<256, P2_HPT_256, false>(
+                            s_out, s_max, s_lse, output_us, seq_lens_i,
+                            nh, num_chunks, batch, ndi);
+                    });
+                });
+            }
+        } else {
+            // GQA < 4: fall back to scalar
+            goto scalar_fallback;
         }
     } else if (hd == 256) {
         // ===== Prefill HD=256: DPAS-based 32-thread WG kernel =====
@@ -691,6 +789,7 @@ at::Tensor esimd_sdp_paged(
             }
         }
     } else {
+    scalar_fallback: {
         // ===== Decode or non-128/256 head dim: scalar fallback =====
         int max_query_len = 0;
         if (num_tokens == batch) {
@@ -727,7 +826,7 @@ at::Tensor esimd_sdp_paged(
                 });
             });
         }
-    }
+    } }
 
     return output;
 }
