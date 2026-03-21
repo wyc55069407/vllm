@@ -520,41 +520,43 @@ at::Tensor esimd_sdp_paged(
 
     if (is_decode && hd == 128) {
         // ===== Optimized two-phase decode for HD=128 =====
-        // Supports GQA ratios: 16:1 (Q_HEAD_PER_T=8), 8:1 (Q_HEAD_PER_T=8), 4:1 (Q_HEAD_PER_T=4)
+        // Runtime kv_len-based dispatch for optimal SP_BLK/CHUNK per sequence length.
+        // Sweep results (32Q/2KV fp16, batch=1, in-order):
+        //   kv<=4K:  QHT=4 HGPG=4 SP=64  CHK=512  → 127 GB/s
+        //   kv<=8K:  QHT=4 HGPG=4 SP=128 CHK=1024 → 154 GB/s
+        //   kv>8K:   QHT=4 HGPG=4 SP=256 CHK=1024 → 156-159 GB/s
         int gqa_ratio = nh / nkvh;
-
-        constexpr int DEC128_SP_BLK = 64;
-        constexpr int DEC128_CHUNK = 256;
-        constexpr int DEC128_SP_PER_T = DEC128_CHUNK / DEC128_SP_BLK;  // 4
-
         int max_sl = (int)max_seq_len;
-        int num_chunks = (max_sl + DEC128_CHUNK - 1) / DEC128_CHUNK;
 
-        // Separate fp32 scratch buffers — per-request scratch for batch>1 correctness
-        int64_t scratch_out_elems = (int64_t)batch * num_chunks * nh * 128;  // HD=128
-        int64_t scratch_sc_elems = (int64_t)batch * num_chunks * nh;
-        auto scratch_out_t = at::empty({scratch_out_elems}, query.options().dtype(at::kFloat));
-        auto scratch_max_t = at::empty({scratch_sc_elems}, query.options().dtype(at::kFloat));
-        auto scratch_lse_t = at::empty({scratch_sc_elems}, query.options().dtype(at::kFloat));
-        auto* s_out = scratch_out_t.data_ptr<float>();
-        auto* s_max = scratch_max_t.data_ptr<float>();
-        auto* s_lse = scratch_lse_t.data_ptr<float>();
-
-        // Phase2: one thread per HEADS_PER_THREAD=4 heads
+        // Phase2: one thread per HEADS_PER_THREAD=4 heads (shared across all configs)
         constexpr int P2_HPT_128 = 4;
-        int64_t p2_threads = (int64_t)batch * nh / P2_HPT_128;
-        sycl::nd_range<1> p2_range(sycl::range<1>(p2_threads), sycl::range<1>(1));
 
-        // Lambda to dispatch phase1 + phase2 with compile-time NKVH, QHT, HGPG
-        auto dispatch_128 = [&]<int NKVH, int QHT, int HGPG, bool BF16>() {
+        // Generic dispatch lambda: compile-time NKVH, QHT, SP_BLK, CHUNK, HGPG, BF16
+        auto dispatch_128 = [&]<int NKVH, int QHT, int SP_BLK, int CHUNK, int HGPG, bool BF16>() {
+            constexpr int SP_PER_T = CHUNK / SP_BLK;
+            int num_chunks = (max_sl + CHUNK - 1) / CHUNK;
+
+            // Separate fp32 scratch buffers — per-request scratch for batch>1 correctness
+            int64_t scratch_out_elems = (int64_t)batch * num_chunks * nh * 128;
+            int64_t scratch_sc_elems = (int64_t)batch * num_chunks * nh;
+            auto scratch_out_t = at::empty({scratch_out_elems}, query.options().dtype(at::kFloat));
+            auto scratch_max_t = at::empty({scratch_sc_elems}, query.options().dtype(at::kFloat));
+            auto scratch_lse_t = at::empty({scratch_sc_elems}, query.options().dtype(at::kFloat));
+            auto* s_out = scratch_out_t.data_ptr<float>();
+            auto* s_max = scratch_max_t.data_ptr<float>();
+            auto* s_lse = scratch_lse_t.data_ptr<float>();
+
             int64_t global_dim2 = (int64_t)batch * nkvh * HGPG;
-            sycl::range<3> global_p1(1, (int64_t)num_chunks * DEC128_SP_PER_T, global_dim2);
-            sycl::range<3> local_p1(1, DEC128_SP_PER_T, HGPG);
+            sycl::range<3> global_p1(1, (int64_t)num_chunks * SP_PER_T, global_dim2);
+            sycl::range<3> local_p1(1, SP_PER_T, HGPG);
+
+            int64_t p2_threads = (int64_t)batch * nh / P2_HPT_128;
+            sycl::nd_range<1> p2_range(sycl::range<1>(p2_threads), sycl::range<1>(1));
 
             dpcpp_queue.submit([&](sycl::handler& cgh) {
                 cgh.parallel_for(sycl::nd_range<3>(global_p1, local_p1),
                     [=](sycl::nd_item<3> ndi) SYCL_ESIMD_KERNEL {
-                    sdp_paged_decode_opt_phase1<128, NKVH, QHT, DEC128_SP_BLK, DEC128_CHUNK, HGPG, BF16>(
+                    sdp_paged_decode_opt_phase1<128, NKVH, QHT, SP_BLK, CHUNK, HGPG, BF16>(
                         query_us, kv_cache_us, s_out, s_max, s_lse,
                         block_table_i, seq_lens_i,
                         nh, bs, mbps,
@@ -572,23 +574,33 @@ at::Tensor esimd_sdp_paged(
         };
 
         if (gqa_ratio >= 16) {
-            // 16:1 GQA (e.g. 32Q/2KV): QHT=8, HGPG=2
+            // 16:1 GQA (e.g. 32Q/2KV): QHT=4, HGPG=4
+            // Runtime kv_len-based SP_BLK/CHUNK selection
+            // NKVH template: 2 for common case, 4 for fallback
+            #define DISPATCH_16TO1(NKVH_VAL, BF16_VAL) \
+                if (max_sl <= 4096) { \
+                    dispatch_128.template operator()<NKVH_VAL, 4, 64, 512, 4, BF16_VAL>(); \
+                } else if (max_sl <= 8192) { \
+                    dispatch_128.template operator()<NKVH_VAL, 4, 128, 1024, 4, BF16_VAL>(); \
+                } else { \
+                    dispatch_128.template operator()<NKVH_VAL, 4, 256, 1024, 4, BF16_VAL>(); \
+                }
             if (nkvh == 2) {
-                if (is_bf16) dispatch_128.template operator()<2, 8, 2, true>();
-                else         dispatch_128.template operator()<2, 8, 2, false>();
+                if (is_bf16) { DISPATCH_16TO1(2, true) }
+                else         { DISPATCH_16TO1(2, false) }
             } else {
-                // Generic 16:1 with different nkvh — use nkvh=4 as fallback
-                if (is_bf16) dispatch_128.template operator()<4, 8, 2, true>();
-                else         dispatch_128.template operator()<4, 8, 2, false>();
+                if (is_bf16) { DISPATCH_16TO1(4, true) }
+                else         { DISPATCH_16TO1(4, false) }
             }
+            #undef DISPATCH_16TO1
         } else if (gqa_ratio >= 8) {
-            // 8:1 GQA (e.g. 32Q/4KV): QHT=8, HGPG=1
-            if (is_bf16) dispatch_128.template operator()<4, 8, 1, true>();
-            else         dispatch_128.template operator()<4, 8, 1, false>();
+            // 8:1 GQA (e.g. 32Q/4KV): QHT=8, HGPG=1, SP=64, CHK=256
+            if (is_bf16) dispatch_128.template operator()<4, 8, 64, 256, 1, true>();
+            else         dispatch_128.template operator()<4, 8, 64, 256, 1, false>();
         } else if (gqa_ratio >= 4) {
-            // 4:1 GQA: QHT=4, HGPG=1
-            if (is_bf16) dispatch_128.template operator()<4, 4, 1, true>();
-            else         dispatch_128.template operator()<4, 4, 1, false>();
+            // 4:1 GQA: QHT=4, HGPG=1, SP=64, CHK=256
+            if (is_bf16) dispatch_128.template operator()<4, 4, 64, 256, 1, true>();
+            else         dispatch_128.template operator()<4, 4, 64, 256, 1, false>();
         } else {
             // GQA < 4: fall back to scalar
             goto scalar_fallback;
