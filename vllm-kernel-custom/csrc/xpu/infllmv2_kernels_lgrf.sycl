@@ -1,0 +1,457 @@
+/* infllmv2_kernels_lgrf.sycl — InfLLMv2 sparse attention dispatch wrappers.
+ *
+ * Torch-callable functions for:
+ *   - Sparse paged SDP (decode + prefill)
+ *   - Pattern detection pipeline (k_pooling, qk_gemm, max_pooling, topk)
+ *   - Mask conversion (per-token -> per-q-block union)
+ *
+ * All compiled with doubleGRF (LGRF).
+ */
+
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <torch/python.h>
+
+#include <cmath>
+#include <cstdint>
+#include <sycl/sycl.hpp>
+
+#ifndef FP32_MIN
+#define FP32_MIN (-3.402823466e+38f)
+#endif
+
+using namespace sycl::ext::intel::experimental;
+
+#include "esimd_kernels/sdp_paged_sparse.h"
+#include "esimd_kernels/infllmv2_pattern.h"
+#include "esimd_kernels/mask_convert.h"
+
+
+/* ============================================================
+ * Sparse Paged SDP — decode + prefill
+ *
+ * Dispatch:
+ *   - Decode (max_query_len==1): Two-phase sparse decode
+ *       Phase 1: mask-directed paged blocks
+ *       Phase 2: reuses sdp_paged_decode_opt_phase2
+ *   - Prefill (max_query_len>1): Sparse prefill with union mask
+ * ============================================================ */
+at::Tensor esimd_sdp_paged_sparse(
+    at::Tensor query,              // [num_tokens, num_heads, head_dim]
+    at::Tensor kv_cache,           // [2, num_blocks, block_size, num_kv_heads, head_dim]
+    at::Tensor output,             // [num_tokens, num_heads, head_dim]
+    at::Tensor block_table,        // [batch, max_blocks_per_seq] i32
+    at::Tensor seq_lens,           // [batch] i32
+    at::Tensor query_start_loc,    // [batch+1] i32
+    at::Tensor sparse_mask,        // decode: [batch, num_kv_heads, 64] u32
+                                   // prefill: [num_kv_heads, q_blocks, 1024] u32
+    at::Tensor sparse_mask_cnt,    // prefill: [num_kv_heads, q_blocks] u32 (empty for decode)
+    int64_t num_heads, int64_t num_kv_heads,
+    int64_t head_dim, int64_t block_size,
+    int64_t max_seq_len, double attn_scale,
+    int64_t is_decode,
+    int64_t num_sparse_blocks)     // decode: 64 (fixed); prefill: max mask cnt
+{
+    auto stream = at::xpu::getCurrentXPUStream();
+    auto& dpcpp_queue = stream.queue();
+
+    int batch = (int)seq_lens.size(0);
+    int num_tokens = (int)query.size(0);
+    int max_blocks_per_seq = (int)block_table.size(1);
+
+    auto* query_us      = reinterpret_cast<const unsigned short*>(query.data_ptr());
+    auto* kv_cache_us   = reinterpret_cast<const unsigned short*>(kv_cache.data_ptr());
+    auto* output_us     = reinterpret_cast<unsigned short*>(output.data_ptr());
+    auto* block_table_i = block_table.data_ptr<int>();
+    auto* seq_lens_i    = seq_lens.data_ptr<int>();
+    auto* qsl_i         = query_start_loc.data_ptr<int>();
+    auto* mask_u32      = reinterpret_cast<const uint32_t*>(sparse_mask.data_ptr());
+    auto* mask_cnt_u32  = sparse_mask_cnt.numel() > 0
+                        ? reinterpret_cast<const uint32_t*>(sparse_mask_cnt.data_ptr())
+                        : nullptr;
+
+    int nh = (int)num_heads, nkvh = (int)num_kv_heads, hd = (int)head_dim;
+    int bs = (int)block_size, mbps = max_blocks_per_seq;
+    float as_f = (float)attn_scale;
+    int nsb = (int)num_sparse_blocks;
+
+    int64_t kv_s0 = kv_cache.stride(0);  // split (K vs V)
+    int64_t kv_s1 = kv_cache.stride(1);  // block
+
+    bool is_bf16 = (query.scalar_type() == at::ScalarType::BFloat16);
+
+    if (is_decode && hd == 128) {
+        // ===== Sparse decode: two-phase with mask-directed blocks =====
+        // Fixed config: HD=128, nsb=64, sp_blk=64, chunk=256
+        // QHT=4, HGPG=4 (matches dense decode config)
+        constexpr int HD = 128;
+        constexpr int SP_BLK = 64;
+        constexpr int NSB = 64;
+        constexpr int CHUNK = 256;
+        constexpr int SP_PER_T = CHUNK / SP_BLK;  // 4
+        constexpr int CHUNK_NUM = NSB / SP_PER_T;  // 16
+        constexpr int QHT = 4;
+        constexpr int P2_HPT = 16;
+
+        auto dispatch_sparse_decode = [&]<int NKVH, int HGPG, bool BF16>() {
+            // Scratch buffers (same layout as dense decode)
+            int64_t scratch_out_elems = (int64_t)batch * CHUNK_NUM * nh * HD;
+            int64_t scratch_sc_elems = (int64_t)batch * CHUNK_NUM * nh;
+            auto scratch_out_t = at::empty({scratch_out_elems}, query.options().dtype(at::kFloat));
+            auto scratch_max_t = at::empty({scratch_sc_elems}, query.options().dtype(at::kFloat));
+            auto scratch_lse_t = at::empty({scratch_sc_elems}, query.options().dtype(at::kFloat));
+            auto* s_out = scratch_out_t.data_ptr<float>();
+            auto* s_max = scratch_max_t.data_ptr<float>();
+            auto* s_lse = scratch_lse_t.data_ptr<float>();
+
+            int64_t global_dim2 = (int64_t)batch * NKVH * HGPG;
+            sycl::range<3> global_p1(1, (int64_t)CHUNK_NUM * SP_PER_T, global_dim2);
+            sycl::range<3> local_p1(1, SP_PER_T, HGPG);
+
+            // Phase 1: sparse decode
+            dpcpp_queue.submit([&](sycl::handler& cgh) {
+                cgh.parallel_for(sycl::nd_range<3>(global_p1, local_p1),
+                    [=](sycl::nd_item<3> ndi) SYCL_ESIMD_KERNEL {
+                    sdp_paged_decode_sparse_phase1<HD, NKVH, QHT, SP_BLK, NSB, CHUNK, HGPG, BF16>(
+                        query_us, kv_cache_us,
+                        s_out, s_max, s_lse,
+                        block_table_i, seq_lens_i, mask_u32,
+                        nh, bs, mbps,
+                        kv_s0, kv_s1,
+                        as_f, CHUNK_NUM, batch, ndi);
+                });
+            });
+
+            // Phase 2: reduction (reuse from sdp_paged.h)
+            int64_t p2_threads = (int64_t)batch * nh / P2_HPT;
+            sycl::nd_range<1> p2_range(sycl::range<1>(p2_threads), sycl::range<1>(1));
+
+            dpcpp_queue.submit([&](sycl::handler& cgh) {
+                cgh.parallel_for(p2_range,
+                    [=](sycl::nd_item<1> ndi) SYCL_ESIMD_KERNEL {
+                    sdp_paged_decode_opt_phase2<HD, P2_HPT, BF16>(
+                        s_out, s_max, s_lse,
+                        output_us, seq_lens_i,
+                        nh, CHUNK_NUM, batch, ndi);
+                });
+            });
+        };
+
+        // Dispatch by num_kv_heads and dtype
+        int gqa_ratio = nh / nkvh;
+        if (nkvh == 2 && gqa_ratio == 16) {
+            if (is_bf16) dispatch_sparse_decode.template operator()<2, 4, true>();
+            else         dispatch_sparse_decode.template operator()<2, 4, false>();
+        } else if (nkvh == 4 && gqa_ratio == 8) {
+            if (is_bf16) dispatch_sparse_decode.template operator()<4, 4, true>();
+            else         dispatch_sparse_decode.template operator()<4, 4, false>();
+        } else {
+            TORCH_CHECK(false, "Unsupported sparse decode config: nkvh=", nkvh,
+                        " gqa_ratio=", gqa_ratio);
+        }
+
+    } else if (!is_decode && hd == 128) {
+        // ===== Sparse prefill: union mask directed =====
+        // Dispatch per request: each request has its own q_len and mask
+        // For now: single-request dispatch (batch=1 during chunked prefill)
+        TORCH_CHECK(batch == 1, "Sparse prefill currently supports batch=1 only");
+
+        int req_idx = 0;
+        // query is already sliced in Python, so q_len = num_tokens
+        int q_len = num_tokens;
+        // max_seq_len = full sequence length for this request
+        int history_len = (int)max_seq_len - q_len;
+
+        // Query and output pointers (already sliced in Python)
+        auto* req_query = query_us;
+        auto* req_output = output_us;
+
+        uint32_t q_blocks = ((uint32_t)q_len + 15u) / 16u;
+
+        auto dispatch_sparse_prefill = [&]<bool CAUSAL, bool BF16>() {
+            int64_t total_wgs = (int64_t)q_blocks * nh;
+            sycl::nd_range<1> Range(sycl::range<1>(total_wgs * 16), sycl::range<1>(16));
+
+            dpcpp_queue.submit([&](sycl::handler& cgh) {
+                cgh.parallel_for(Range,
+                    [=](sycl::nd_item<1> ndi) SYCL_ESIMD_KERNEL {
+                    sdp_paged_prefill_sparse_dpas_128<CAUSAL, BF16>(
+                        req_query, kv_cache_us, req_output,
+                        block_table_i, seq_lens_i,
+                        mask_u32, mask_cnt_u32,
+                        req_idx, q_len, history_len,
+                        nh, nkvh,
+                        bs, mbps,
+                        kv_s0, kv_s1,
+                        as_f, nh, ndi);
+                });
+            });
+        };
+
+        // Use non-causal temporarily for debugging
+        if (is_bf16) dispatch_sparse_prefill.template operator()<false, true>();
+        else         dispatch_sparse_prefill.template operator()<false, false>();
+
+    } else {
+        TORCH_CHECK(false, "Unsupported sparse SDP config: hd=", hd,
+                    " is_decode=", (bool)is_decode);
+    }
+
+    return output;
+}
+
+
+/* ============================================================
+ * InfLLMv2 Pattern Detection — K Pooling
+ *
+ * Sliding window mean pooling of K cache.
+ * Input:  [bsz, num_kv_heads, kv_len, head_dim] fp16
+ * Output: [bsz, num_kv_heads, num_blocks, head_dim] fp16
+ * ============================================================ */
+at::Tensor esimd_infllmv2_k_pooling(
+    at::Tensor key_cache,          // [bsz, num_kv_heads, kv_len, head_dim] fp16
+    at::Tensor key_pooled,         // [bsz, num_kv_heads, num_blocks, head_dim] fp16
+    int64_t num_kv_heads, int64_t head_dim,
+    int64_t kv_len, int64_t num_blocks,
+    int64_t kernel_size, int64_t kernel_stride)
+{
+    auto stream = at::xpu::getCurrentXPUStream();
+    auto& dpcpp_queue = stream.queue();
+
+    int bsz = (int)key_cache.size(0);
+    auto* k_ptr = reinterpret_cast<fp16*>(key_cache.data_ptr());
+    auto* kp_ptr = reinterpret_cast<fp16*>(key_pooled.data_ptr());
+
+    // Dispatch for MiniCPM4-8B config: nkvh=2, hd=128, ks=32, kstride=16
+    TORCH_CHECK(num_kv_heads == 2 && head_dim == 128 &&
+                kernel_size == 32 && kernel_stride == 16,
+                "Only nkvh=2, hd=128, ks=32, kstride=16 supported");
+
+    int nb = (int)num_blocks;
+    int kvl = (int)kv_len;
+
+    dpcpp_queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(sycl::range<3>(bsz, 2, nb),
+            [=](sycl::id<3> idx) SYCL_ESIMD_KERNEL {
+            infllmv2_k_pooling<2, 128, 32, 16>(k_ptr, kp_ptr, kvl, nb, idx);
+        });
+    });
+
+    return key_pooled;
+}
+
+
+/* ============================================================
+ * InfLLMv2 Pattern Detection — Prefill Pipeline
+ *
+ * qk_gemm → qk_max_pooling → topk_indices
+ * ============================================================ */
+at::Tensor esimd_infllmv2_pattern_prefill(
+    at::Tensor query,              // [bsz, num_heads, seq_len, head_dim] fp16
+    at::Tensor key_pooled,         // [bsz, num_kv_heads, num_blocks, head_dim] fp16
+    at::Tensor block_scores,       // [bsz, num_kv_heads, seq_len, num_blocks] fp16
+    at::Tensor pooled_scores,      // [bsz, num_kv_heads, seq_len, num_pooled] fp16
+    at::Tensor topk_output,        // [bsz, num_kv_heads, seq_len, topk] i32
+    int64_t num_heads, int64_t num_kv_heads,
+    int64_t seq_len, int64_t num_blocks,
+    int64_t head_dim, int64_t num_pooled,
+    int64_t cache_len, int64_t causal,
+    int64_t init_block, int64_t local_block,
+    int64_t topk)
+{
+    auto stream = at::xpu::getCurrentXPUStream();
+    auto& dpcpp_queue = stream.queue();
+
+    int bsz = (int)query.size(0);
+    auto* q_ptr = reinterpret_cast<fp16*>(query.data_ptr());
+    auto* kp_ptr = reinterpret_cast<fp16*>(key_pooled.data_ptr());
+    auto* bs_ptr = reinterpret_cast<fp16*>(block_scores.data_ptr());
+    auto* ps_ptr = reinterpret_cast<fp16*>(pooled_scores.data_ptr());
+    auto* tk_ptr = topk_output.data_ptr<int32_t>();
+
+    int sl = (int)seq_len, nb = (int)num_blocks, np = (int)num_pooled;
+    int cl = (int)cache_len, ib = (int)init_block, lb = (int)local_block;
+    bool is_causal = (bool)causal;
+
+    TORCH_CHECK(num_heads == 32 && num_kv_heads == 2 && head_dim == 128,
+                "Only nh=32, nkvh=2, hd=128 supported for prefill pattern");
+
+    // Step 1: QK GEMM with softmax
+    {
+        sycl::range<3> global(bsz, 2, sl);
+        sycl::range<3> local(1, 1, 1);
+        dpcpp_queue.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(sycl::nd_range<3>(global, local),
+                [=](sycl::nd_item<3> item) SYCL_ESIMD_KERNEL {
+                infllmv2_qk_gemm<32, 2, 128, 32, 16>(
+                    q_ptr, kp_ptr, bs_ptr, sl, nb, cl, is_causal, item);
+            });
+        });
+    }
+
+    // Step 2: Max pooling
+    {
+        dpcpp_queue.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(sycl::range<3>(bsz, 2, sl),
+                [=](sycl::id<3> idx) SYCL_ESIMD_KERNEL {
+                infllmv2_qk_max_pooling<2, 64, 16>(
+                    bs_ptr, ps_ptr, sl, nb, np, ib, lb, cl, idx);
+            });
+        });
+    }
+
+    // Step 3: TopK
+    {
+        dpcpp_queue.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(sycl::range<3>(bsz, 2, sl),
+                [=](sycl::id<3> idx) SYCL_ESIMD_KERNEL {
+                infllmv2_topk_indices<2, 64>(ps_ptr, tk_ptr, sl, np, idx);
+            });
+        });
+    }
+
+    return topk_output;
+}
+
+
+/* ============================================================
+ * InfLLMv2 Pattern Detection — Decode Pipeline
+ *
+ * qk_gemm_decode → softmax_decode → pooling_decode →
+ * qk_max_pooling → topk_indices
+ * ============================================================ */
+at::Tensor esimd_infllmv2_pattern_decode(
+    at::Tensor query,              // [bsz, num_heads, seq_len, head_dim] fp16
+    at::Tensor key_pooled,         // [bsz, num_kv_heads, num_blocks, head_dim] fp16
+    at::Tensor block_scores,       // [bsz, num_heads, seq_len, num_blocks] fp16 (workspace)
+    at::Tensor kv_block_scores,    // [bsz, num_kv_heads, seq_len, num_blocks] fp16 (workspace)
+    at::Tensor pooled_scores,      // [bsz, num_kv_heads, seq_len, num_pooled] fp16 (workspace)
+    at::Tensor topk_output,        // [bsz, num_kv_heads, seq_len, topk] i32
+    int64_t num_heads, int64_t num_kv_heads,
+    int64_t seq_len, int64_t num_blocks,
+    int64_t head_dim, int64_t num_pooled,
+    int64_t cache_len, int64_t causal,
+    int64_t init_block, int64_t local_block,
+    int64_t topk)
+{
+    auto stream = at::xpu::getCurrentXPUStream();
+    auto& dpcpp_queue = stream.queue();
+
+    int bsz = (int)query.size(0);
+    auto* q_ptr = reinterpret_cast<fp16*>(query.data_ptr());
+    auto* kp_ptr = reinterpret_cast<fp16*>(key_pooled.data_ptr());
+    auto* bs_ptr = reinterpret_cast<fp16*>(block_scores.data_ptr());
+    auto* kvbs_ptr = reinterpret_cast<fp16*>(kv_block_scores.data_ptr());
+    auto* ps_ptr = reinterpret_cast<fp16*>(pooled_scores.data_ptr());
+    auto* tk_ptr = topk_output.data_ptr<int32_t>();
+
+    int sl = (int)seq_len, nb = (int)num_blocks, np = (int)num_pooled;
+    int cl = (int)cache_len, ib = (int)init_block, lb = (int)local_block;
+    bool is_causal = (bool)causal;
+
+    TORCH_CHECK(num_heads == 32 && num_kv_heads == 2 && head_dim == 128,
+                "Only nh=32, nkvh=2, hd=128 supported for decode pattern");
+
+    int ts = (int)dpcpp_queue.get_device().get_info<sycl::info::device::max_compute_units>() * 8;
+
+    // Step 1: QK GEMM decode
+    {
+        sycl::nd_range<3> r(
+            sycl::range<3>(bsz, 2, (size_t)sl * ts),
+            sycl::range<3>(1, 1, 1));
+        dpcpp_queue.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(r, [=](sycl::nd_item<3> item) SYCL_ESIMD_KERNEL {
+                infllmv2_qk_gemm_decode<32, 2, 128, 16>(
+                    q_ptr, kp_ptr, bs_ptr, sl, nb, cl, is_causal, ts, item);
+            });
+        });
+    }
+
+    // Step 2: Softmax decode
+    {
+        constexpr int WG_SIZE = 256;
+        sycl::nd_range<3> r(
+            sycl::range<3>(bsz, 32, (size_t)sl * WG_SIZE),
+            sycl::range<3>(1, 1, WG_SIZE));
+        dpcpp_queue.submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<float, 1> slm(sycl::range<1>(WG_SIZE * 2), cgh);
+            cgh.parallel_for(r, [=](sycl::nd_item<3> item) [[intel::reqd_sub_group_size(32)]] {
+                infllmv2_softmax_decode_kernel<32, WG_SIZE>(
+                    bs_ptr, sl, nb, item, slm);
+            });
+        });
+    }
+
+    // Step 3: GQA pooling (average Q heads -> KV head scores)
+    {
+        sycl::nd_range<3> r(
+            sycl::range<3>(bsz, 2, (size_t)sl * nb),
+            sycl::range<3>(1, 1, 1));
+        dpcpp_queue.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(r, [=](sycl::nd_item<3> item) SYCL_ESIMD_KERNEL {
+                infllmv2_pooling_decode<32, 2>(bs_ptr, kvbs_ptr, sl, nb, item);
+            });
+        });
+    }
+
+    // Step 4: Max pooling
+    {
+        dpcpp_queue.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(sycl::range<3>(bsz, 2, sl),
+                [=](sycl::id<3> idx) SYCL_ESIMD_KERNEL {
+                infllmv2_qk_max_pooling<2, 64, 16>(
+                    kvbs_ptr, ps_ptr, sl, nb, np, ib, lb, cl, idx);
+            });
+        });
+    }
+
+    // Step 5: TopK
+    {
+        dpcpp_queue.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(sycl::range<3>(bsz, 2, sl),
+                [=](sycl::id<3> idx) SYCL_ESIMD_KERNEL {
+                infllmv2_topk_indices<2, 64>(ps_ptr, tk_ptr, sl, np, idx);
+            });
+        });
+    }
+
+    return topk_output;
+}
+
+
+/* ============================================================
+ * InfLLMv2 Mask Convert — per-token to per-q-block union
+ *
+ * Input:  mask_orig [num_kv_heads, qlen, 64] u32
+ * Output: mask_out  [num_kv_heads, qlen/16, 1024] u32
+ *         mask_cnt  [num_kv_heads, qlen/16] u32
+ * ============================================================ */
+at::Tensor esimd_infllmv2_mask_convert(
+    at::Tensor mask_orig,          // [num_kv_heads, qlen, 64] i32
+    at::Tensor mask_out,           // [num_kv_heads, q_blocks, 1024] i32
+    at::Tensor mask_cnt_out,       // [num_kv_heads, q_blocks] i32
+    int64_t qlen,
+    int64_t num_kv_heads,
+    int64_t total_kv_blocks)       // = kv_len / 64
+{
+    auto stream = at::xpu::getCurrentXPUStream();
+    auto& dpcpp_queue = stream.queue();
+
+    auto* mo_ptr = reinterpret_cast<uint32_t*>(mask_orig.data_ptr());
+    auto* mout_ptr = reinterpret_cast<uint32_t*>(mask_out.data_ptr());
+    auto* mcnt_ptr = reinterpret_cast<uint32_t*>(mask_cnt_out.data_ptr());
+
+    uint32_t ql = (uint32_t)qlen;
+    uint32_t nkvh = (uint32_t)num_kv_heads;
+    uint32_t tkb = (uint32_t)total_kv_blocks;
+    uint32_t q_blocks = (ql + 15u) / 16u;
+
+    sycl::nd_range<1> range(sycl::range<1>(nkvh * q_blocks), sycl::range<1>(1));
+
+    dpcpp_queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(range,
+            MaskConvertFunctor{mo_ptr, mout_ptr, mcnt_ptr, ql, nkvh, tkb});
+    });
+
+    return mask_cnt_out;
+}

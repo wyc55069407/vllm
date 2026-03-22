@@ -47,6 +47,12 @@ from vllm_kernel_custom.esimd_ops import (
     esimd_sdp_mla_lgrf,
     esimd_sdp_paged,
     esimd_gdn_update,
+    # InfLLMv2 ops (LGRF)
+    esimd_sdp_paged_sparse,
+    esimd_infllmv2_k_pooling,
+    esimd_infllmv2_pattern_prefill,
+    esimd_infllmv2_pattern_decode,
+    esimd_infllmv2_mask_convert,
 )
 
 from vllm_kernel_custom.version import __version__

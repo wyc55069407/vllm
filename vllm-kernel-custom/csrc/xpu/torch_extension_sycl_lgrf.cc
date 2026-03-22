@@ -54,6 +54,53 @@ TORCH_LIBRARY_FRAGMENT(vllm_kernel_custom, m) {
         "int max_seq_len, float attn_scale, "
         "int causal) -> Tensor");
   m.impl("esimd_sdp_paged", torch::kXPU, &esimd_sdp_paged);
+
+  /* === InfLLMv2 Sparse Paged SDP === */
+  m.def("esimd_sdp_paged_sparse(Tensor query, Tensor kv_cache, Tensor output, "
+        "Tensor block_table, Tensor seq_lens, Tensor query_start_loc, "
+        "Tensor sparse_mask, Tensor sparse_mask_cnt, "
+        "int num_heads, int num_kv_heads, "
+        "int head_dim, int block_size, "
+        "int max_seq_len, float attn_scale, "
+        "int is_decode, int num_sparse_blocks) -> Tensor");
+  m.impl("esimd_sdp_paged_sparse", torch::kXPU, &esimd_sdp_paged_sparse);
+
+  /* === InfLLMv2 K Pooling === */
+  m.def("esimd_infllmv2_k_pooling(Tensor key_cache, Tensor key_pooled, "
+        "int num_kv_heads, int head_dim, "
+        "int kv_len, int num_blocks, "
+        "int kernel_size, int kernel_stride) -> Tensor");
+  m.impl("esimd_infllmv2_k_pooling", torch::kXPU, &esimd_infllmv2_k_pooling);
+
+  /* === InfLLMv2 Pattern Detection — Prefill === */
+  m.def("esimd_infllmv2_pattern_prefill(Tensor query, Tensor key_pooled, "
+        "Tensor block_scores, Tensor pooled_scores, Tensor topk_output, "
+        "int num_heads, int num_kv_heads, "
+        "int seq_len, int num_blocks, "
+        "int head_dim, int num_pooled, "
+        "int cache_len, int causal, "
+        "int init_block, int local_block, "
+        "int topk) -> Tensor");
+  m.impl("esimd_infllmv2_pattern_prefill", torch::kXPU, &esimd_infllmv2_pattern_prefill);
+
+  /* === InfLLMv2 Pattern Detection — Decode === */
+  m.def("esimd_infllmv2_pattern_decode(Tensor query, Tensor key_pooled, "
+        "Tensor block_scores, Tensor kv_block_scores, "
+        "Tensor pooled_scores, Tensor topk_output, "
+        "int num_heads, int num_kv_heads, "
+        "int seq_len, int num_blocks, "
+        "int head_dim, int num_pooled, "
+        "int cache_len, int causal, "
+        "int init_block, int local_block, "
+        "int topk) -> Tensor");
+  m.impl("esimd_infllmv2_pattern_decode", torch::kXPU, &esimd_infllmv2_pattern_decode);
+
+  /* === InfLLMv2 Mask Convert === */
+  m.def("esimd_infllmv2_mask_convert(Tensor mask_orig, Tensor mask_out, "
+        "Tensor mask_cnt_out, "
+        "int qlen, int num_kv_heads, "
+        "int total_kv_blocks) -> Tensor");
+  m.impl("esimd_infllmv2_mask_convert", torch::kXPU, &esimd_infllmv2_mask_convert);
 }
 
 REGISTER_EXTENSION(common_ops_lgrf)

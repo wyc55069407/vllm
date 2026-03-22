@@ -72,6 +72,7 @@ ext_modules.append(
 ### for lgrf esimd kernels
 sources = [
     "csrc/xpu/uni_esimd_kernel_lgrf.sycl",
+    "csrc/xpu/infllmv2_kernels_lgrf.sycl",
     "csrc/xpu/torch_extension_sycl_lgrf.cc",
 ]
 

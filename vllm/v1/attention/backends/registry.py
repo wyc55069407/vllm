@@ -82,6 +82,7 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
         "RocmAiterUnifiedAttentionBackend"
     )
     ESIMD_ATTN = "vllm.v1.attention.backends.esimd_attn.EsimdAttentionBackend"
+    INFLLMV2_ESIMD_ATTN = "vllm.v1.attention.backends.infllmv2_esimd_attn.InfLLMv2EsimdAttentionBackend"
     CPU_ATTN = "vllm.v1.attention.backends.cpu_attn.CPUAttentionBackend"
     # Placeholder for third-party/custom backends - must be registered before use
     # set to None to avoid alias with other backend, whose value is an empty string

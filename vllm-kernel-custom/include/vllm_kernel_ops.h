@@ -252,6 +252,51 @@ at::Tensor esimd_sdp_paged(
     int64_t max_seq_len, double attn_scale,
     int64_t causal);
 
+// InfLLMv2 sparse paged SDP (large GRF)
+at::Tensor esimd_sdp_paged_sparse(
+    at::Tensor query, at::Tensor kv_cache, at::Tensor output,
+    at::Tensor block_table, at::Tensor seq_lens, at::Tensor query_start_loc,
+    at::Tensor sparse_mask, at::Tensor sparse_mask_cnt,
+    int64_t num_heads, int64_t num_kv_heads,
+    int64_t head_dim, int64_t block_size,
+    int64_t max_seq_len, double attn_scale,
+    int64_t is_decode, int64_t num_sparse_blocks);
+
+// InfLLMv2 K pooling (large GRF)
+at::Tensor esimd_infllmv2_k_pooling(
+    at::Tensor key_cache, at::Tensor key_pooled,
+    int64_t num_kv_heads, int64_t head_dim,
+    int64_t kv_len, int64_t num_blocks,
+    int64_t kernel_size, int64_t kernel_stride);
+
+// InfLLMv2 pattern detection — prefill (large GRF)
+at::Tensor esimd_infllmv2_pattern_prefill(
+    at::Tensor query, at::Tensor key_pooled,
+    at::Tensor block_scores, at::Tensor pooled_scores, at::Tensor topk_output,
+    int64_t num_heads, int64_t num_kv_heads,
+    int64_t seq_len, int64_t num_blocks,
+    int64_t head_dim, int64_t num_pooled,
+    int64_t cache_len, int64_t causal,
+    int64_t init_block, int64_t local_block,
+    int64_t topk);
+
+// InfLLMv2 pattern detection — decode (large GRF)
+at::Tensor esimd_infllmv2_pattern_decode(
+    at::Tensor query, at::Tensor key_pooled,
+    at::Tensor block_scores, at::Tensor kv_block_scores,
+    at::Tensor pooled_scores, at::Tensor topk_output,
+    int64_t num_heads, int64_t num_kv_heads,
+    int64_t seq_len, int64_t num_blocks,
+    int64_t head_dim, int64_t num_pooled,
+    int64_t cache_len, int64_t causal,
+    int64_t init_block, int64_t local_block,
+    int64_t topk);
+
+// InfLLMv2 mask convert (large GRF)
+at::Tensor esimd_infllmv2_mask_convert(
+    at::Tensor mask_orig, at::Tensor mask_out, at::Tensor mask_cnt_out,
+    int64_t qlen, int64_t num_kv_heads, int64_t total_kv_blocks);
+
 // GDN (Gated Delta Network) state update (large GRF)
 at::Tensor esimd_gdn_update(
     at::Tensor A_log, at::Tensor dt_bias,

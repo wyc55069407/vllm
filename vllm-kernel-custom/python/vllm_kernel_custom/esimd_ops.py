@@ -465,6 +465,105 @@ def esimd_sdp_paged(
         max_seq_len, attn_scale, causal)
 
 
+def esimd_sdp_paged_sparse(
+    query: torch.Tensor, kv_cache: torch.Tensor, output: torch.Tensor,
+    block_table: torch.Tensor, seq_lens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    sparse_mask: torch.Tensor, sparse_mask_cnt: torch.Tensor,
+    num_heads: int, num_kv_heads: int,
+    head_dim: int, block_size: int,
+    max_seq_len: int, attn_scale: float,
+    is_decode: int, num_sparse_blocks: int,
+) -> torch.Tensor:
+    """Sparse paged SDP attention for InfLLMv2 (LGRF, doubleGRF).
+
+    Decode: mask = [batch, nkvh, num_sparse_blocks] u32 block indices
+    Prefill: mask = [nkvh, q_blocks, 1024] u32 union block indices
+             mask_cnt = [nkvh, q_blocks] u32 count
+    """
+    return _ops.esimd_sdp_paged_sparse(
+        query, kv_cache, output,
+        block_table, seq_lens, query_start_loc,
+        sparse_mask, sparse_mask_cnt,
+        num_heads, num_kv_heads,
+        head_dim, block_size,
+        max_seq_len, attn_scale,
+        is_decode, num_sparse_blocks)
+
+
+def esimd_infllmv2_k_pooling(
+    key_cache: torch.Tensor, key_pooled: torch.Tensor,
+    num_kv_heads: int, head_dim: int,
+    kv_len: int, num_blocks: int,
+    kernel_size: int, kernel_stride: int,
+) -> torch.Tensor:
+    """InfLLMv2 K cache sliding window mean pooling."""
+    return _ops.esimd_infllmv2_k_pooling(
+        key_cache, key_pooled,
+        num_kv_heads, head_dim,
+        kv_len, num_blocks,
+        kernel_size, kernel_stride)
+
+
+def esimd_infllmv2_pattern_prefill(
+    query: torch.Tensor, key_pooled: torch.Tensor,
+    block_scores: torch.Tensor, pooled_scores: torch.Tensor,
+    topk_output: torch.Tensor,
+    num_heads: int, num_kv_heads: int,
+    seq_len: int, num_blocks: int,
+    head_dim: int, num_pooled: int,
+    cache_len: int, causal: int,
+    init_block: int, local_block: int,
+    topk: int,
+) -> torch.Tensor:
+    """InfLLMv2 prefill pattern detection: qk_gemm → max_pool → topk."""
+    return _ops.esimd_infllmv2_pattern_prefill(
+        query, key_pooled,
+        block_scores, pooled_scores, topk_output,
+        num_heads, num_kv_heads,
+        seq_len, num_blocks,
+        head_dim, num_pooled,
+        cache_len, causal,
+        init_block, local_block,
+        topk)
+
+
+def esimd_infllmv2_pattern_decode(
+    query: torch.Tensor, key_pooled: torch.Tensor,
+    block_scores: torch.Tensor, kv_block_scores: torch.Tensor,
+    pooled_scores: torch.Tensor, topk_output: torch.Tensor,
+    num_heads: int, num_kv_heads: int,
+    seq_len: int, num_blocks: int,
+    head_dim: int, num_pooled: int,
+    cache_len: int, causal: int,
+    init_block: int, local_block: int,
+    topk: int,
+) -> torch.Tensor:
+    """InfLLMv2 decode pattern detection: qk_gemm → softmax → pool → max_pool → topk."""
+    return _ops.esimd_infllmv2_pattern_decode(
+        query, key_pooled,
+        block_scores, kv_block_scores,
+        pooled_scores, topk_output,
+        num_heads, num_kv_heads,
+        seq_len, num_blocks,
+        head_dim, num_pooled,
+        cache_len, causal,
+        init_block, local_block,
+        topk)
+
+
+def esimd_infllmv2_mask_convert(
+    mask_orig: torch.Tensor, mask_out: torch.Tensor,
+    mask_cnt_out: torch.Tensor,
+    qlen: int, num_kv_heads: int,
+    total_kv_blocks: int,
+) -> torch.Tensor:
+    """InfLLMv2 mask convert: per-token [nkvh, qlen, 64] -> per-q-block union [nkvh, q_blocks, 1024]."""
+    return _ops.esimd_infllmv2_mask_convert(
+        mask_orig, mask_out, mask_cnt_out,
+        qlen, num_kv_heads, total_kv_blocks)
+
+
 def esimd_gdn_update(
     A_log: torch.Tensor, dt_bias: torch.Tensor,
     a: torch.Tensor, b: torch.Tensor,

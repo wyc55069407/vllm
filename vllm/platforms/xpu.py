@@ -69,6 +69,9 @@ class XPUPlatform(Platform):
         if selected_backend == AttentionBackendEnum.ESIMD_ATTN:
             logger.info_once("Using ESIMD Attention backend.")
             return AttentionBackendEnum.ESIMD_ATTN.get_path()
+        if selected_backend == AttentionBackendEnum.INFLLMV2_ESIMD_ATTN:
+            logger.info_once("Using InfLLMv2 ESIMD Attention backend.")
+            return AttentionBackendEnum.INFLLMV2_ESIMD_ATTN.get_path()
         if selected_backend == AttentionBackendEnum.TRITON_ATTN:
             logger.info_once("Using Triton backend.")
             return AttentionBackendEnum.TRITON_ATTN.get_path()
