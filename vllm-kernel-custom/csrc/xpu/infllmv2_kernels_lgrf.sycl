@@ -23,6 +23,7 @@
 using namespace sycl::ext::intel::experimental;
 
 #include "esimd_kernels/sdp_paged_sparse.h"
+#include "esimd_kernels/sdp_paged_sparse_gqa.h"
 #include "esimd_kernels/infllmv2_pattern.h"
 #include "esimd_kernels/mask_convert.h"
 
@@ -151,46 +152,32 @@ at::Tensor esimd_sdp_paged_sparse(
         }
 
     } else if (!is_decode && hd == 128) {
-        // ===== Sparse prefill: union mask directed =====
-        // Dispatch per request: each request has its own q_len and mask
-        // For now: single-request dispatch (batch=1 during chunked prefill)
         TORCH_CHECK(batch == 1, "Sparse prefill currently supports batch=1 only");
 
-        int req_idx = 0;
-        // query is already sliced in Python, so q_len = num_tokens
         int q_len = num_tokens;
-        // max_seq_len = full sequence length for this request
         int history_len = (int)max_seq_len - q_len;
-
-        // Query and output pointers (already sliced in Python)
-        auto* req_query = query_us;
-        auto* req_output = output_us;
-
+        int kv_seq_len = (int)max_seq_len;
         uint32_t q_blocks = ((uint32_t)q_len + 15u) / 16u;
 
-        auto dispatch_sparse_prefill = [&]<bool CAUSAL, bool BF16>() {
-            int64_t total_wgs = (int64_t)q_blocks * nh;
-            sycl::nd_range<1> Range(sycl::range<1>(total_wgs * 16), sycl::range<1>(16));
+        // Fast GQA-grouped sparse prefill
+        // 2D dispatch: {q_blocks, nkvh*16} — each WG handles 1 q_block × 1 kv_head × 16 q_heads
+        sycl::nd_range<2> Range({(size_t)q_blocks, (size_t)nkvh * 16}, {1, 16});
 
+        auto dispatch_sparse_prefill = [&]<bool BF16>() {
+            SparseFlashAttnPagedFunctor<true, BF16> f{
+                query_us, kv_cache_us, (uint8_t*)output_us,
+                const_cast<uint32_t*>(mask_u32), const_cast<uint32_t*>(mask_cnt_u32),
+                block_table_i,
+                q_len, kv_seq_len, history_len,
+                nh, nkvh, bs,
+                kv_s0, kv_s1, as_f};
             dpcpp_queue.submit([&](sycl::handler& cgh) {
-                cgh.parallel_for(Range,
-                    [=](sycl::nd_item<1> ndi) SYCL_ESIMD_KERNEL {
-                    sdp_paged_prefill_sparse_dpas_128<CAUSAL, BF16>(
-                        req_query, kv_cache_us, req_output,
-                        block_table_i, seq_lens_i,
-                        mask_u32, mask_cnt_u32,
-                        req_idx, q_len, history_len,
-                        nh, nkvh,
-                        bs, mbps,
-                        kv_s0, kv_s1,
-                        as_f, nh, ndi);
-                });
+                cgh.parallel_for(Range, f);
             });
         };
 
-        // Prefill is always causal
-        if (is_bf16) dispatch_sparse_prefill.template operator()<true, true>();
-        else         dispatch_sparse_prefill.template operator()<true, false>();
+        if (is_bf16) dispatch_sparse_prefill.template operator()<true>();
+        else         dispatch_sparse_prefill.template operator()<false>();
 
     } else {
         TORCH_CHECK(false, "Unsupported sparse SDP config: hd=", hd,

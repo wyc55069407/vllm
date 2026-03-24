@@ -616,6 +616,103 @@ class InfLLMv2EsimdAttentionImpl(AttentionImpl):
             sparse_mask = mask_out.int()
             qsl = torch.tensor([0, q_len], dtype=torch.int32, device=device)
 
+            # Debug: compare fast vs old kernel outputs in-place
+            _cmp_count = getattr(self, '_cmp_count', 0)
+            if _cmp_count < 1 and os.environ.get("INFLLMV2_CMP_KERNELS", "0") == "1":
+                # Save KV cache pages for this layer (first time only)
+                _kv_dump_done = getattr(self, '_kv_dump_done', False)
+                if not _kv_dump_done:
+                    # Save compact KV: only pages referenced by block table
+                    bt_cpu = attn_metadata.block_table.cpu()
+                    sl_val = int(attn_metadata.seq_lens.cpu().max().item())
+                    n_pages = (sl_val + block_size - 1) // block_size
+                    used_pages = bt_cpu[0, :n_pages].tolist()
+                    kv_pages = kv_cache[:, used_pages].cpu().clone()
+                    kv_dump = {
+                        'kv_pages': kv_pages,  # [2, n_pages, bs, nkvh, hd]
+                        'used_pages': used_pages,
+                        'kv_full_shape': kv_cache.shape,
+                        'kv_strides': kv_cache.stride(),
+                        'query': query[:q_len].cpu().clone(),
+                        'block_table': attn_metadata.block_table.cpu().clone(),
+                        'seq_lens': attn_metadata.seq_lens.cpu().clone(),
+                        'sparse_mask': sparse_mask.cpu().clone(),
+                        'sparse_mask_cnt': sparse_mask_cnt.cpu().clone(),
+                        'nh': nh, 'nkvh': nkvh, 'hd': hd, 'bs': block_size,
+                        'max_sl': max_sl, 'scale': self.scale, 'topk': self.topk,
+                    }
+                    torch.save(kv_dump, '/tmp/sparse_kv_dump.pt')
+                    logger.info("KV_DUMP saved: n_pages=%d kv_pages=%s used=%s",
+                               n_pages, kv_pages.shape, used_pages[:10])
+                    self._kv_dump_done = True
+
+                # Log block table and mask details
+                bt = attn_metadata.block_table
+                bt_cpu = bt.cpu()
+                logger.info(
+                    "CMP_DETAIL: bt_shape=%s bt[:20]=%s max_pg=%d "
+                    "mask_cnt_range=[%d,%d] q_len=%d max_sl=%d hist=%d "
+                    "kv_strides=%s",
+                    bt.shape, bt_cpu[0, :20].tolist(), bt_cpu.max().item(),
+                    sparse_mask_cnt.min().item(), sparse_mask_cnt.max().item(),
+                    q_len, max_sl, max_sl - q_len,
+                    kv_cache.stride())
+
+                # Run old kernel
+                out_old = torch.zeros_like(output[:q_len])
+                os.environ["INFLLMV2_FAST_PREFILL"] = "0"
+                self._esimd_sdp_paged_sparse(
+                    query[:q_len], kv_cache, out_old,
+                    attn_metadata.block_table,
+                    attn_metadata.seq_lens,
+                    qsl,
+                    sparse_mask, sparse_mask_cnt,
+                    nh, nkvh, hd, block_size,
+                    max_sl, self.scale, 0, self.topk)
+                torch.xpu.synchronize()
+
+                # Run fast kernel
+                out_fast = torch.zeros_like(output[:q_len])
+                os.environ["INFLLMV2_FAST_PREFILL"] = "1"
+                self._esimd_sdp_paged_sparse(
+                    query[:q_len], kv_cache, out_fast,
+                    attn_metadata.block_table,
+                    attn_metadata.seq_lens,
+                    qsl,
+                    sparse_mask, sparse_mask_cnt,
+                    nh, nkvh, hd, block_size,
+                    max_sl, self.scale, 0, self.topk)
+                torch.xpu.synchronize()
+
+                diff = (out_old.float() - out_fast.float()).abs()
+                # Find which Q positions have largest diff
+                row_diff = diff.max(dim=-1).values.max(dim=-1).values  # [q_len]
+                top5_rows = row_diff.topk(5)
+                logger.info(
+                    "CMP layer=%d: old_max=%.4f fast_max=%.4f "
+                    "diff_mean=%.6f diff_max=%.4f "
+                    "worst_rows=%s worst_diffs=%s",
+                    getattr(self, '_layer_idx', -1),
+                    out_old.float().abs().max().item(),
+                    out_fast.float().abs().max().item(),
+                    diff.mean().item(), diff.max().item(),
+                    top5_rows.indices.tolist(),
+                    [f"{v:.2f}" for v in top5_rows.values.tolist()])
+
+                # Check first and last q_blocks specifically
+                for qb in [0, 1, (q_len - 1) // 16]:
+                    start = qb * 16
+                    end = min(start + 16, q_len)
+                    d = diff[start:end]
+                    logger.info(
+                        "CMP qblock=%d: diff_max=%.4f old_max=%.4f fast_max=%.4f",
+                        qb, d.max().item(), out_old[start:end].float().abs().max().item(),
+                        out_fast[start:end].float().abs().max().item())
+
+                # Use old kernel output for the actual computation
+                output[:q_len].copy_(out_old)
+            self._cmp_count = _cmp_count + 1
+
             self._esimd_sdp_paged_sparse(
                 query[:q_len], kv_cache, output[:q_len],
                 attn_metadata.block_table,
