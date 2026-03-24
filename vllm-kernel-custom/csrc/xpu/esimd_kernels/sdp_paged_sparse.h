@@ -328,13 +328,18 @@ ESIMD_INLINE void sdp_paged_prefill_sparse_dpas_128(
     int32_t kvHeadIdx = headIdx / groupSize;  // derive KV head from Q head
     int32_t this_q_pos = h * 16 + hhq;
 
-    // Causal boundary for this thread's Q position
+    // Causal boundary: each of the 16 Q positions gets its own boundary.
+    // All threads in the WG must produce identical output since all write
+    // all 16 Q positions via scatter.
     simd<int32_t, 16> causal_boundaries;
     if constexpr (IS_CAUSAL) {
-        int32_t boundary = (this_q_pos < q_len)
-                           ? (int32_t)(history_len + this_q_pos) : -1;
         #pragma unroll
-        for (int i = 0; i < 16; i++) causal_boundaries[i] = boundary;
+        for (int i = 0; i < 16; i++) {
+            int32_t q_pos = h * 16 + i;
+            causal_boundaries[i] = (q_pos < q_len)
+                                   ? (int32_t)(history_len + q_pos)
+                                   : 0x7FFFFFFF;  // no masking for padding Q rows
+        }
     }
 
     // Sparse mask for this q_block

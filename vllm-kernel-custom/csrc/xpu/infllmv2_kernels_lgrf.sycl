@@ -188,9 +188,9 @@ at::Tensor esimd_sdp_paged_sparse(
             });
         };
 
-        // Use non-causal temporarily for debugging
-        if (is_bf16) dispatch_sparse_prefill.template operator()<false, true>();
-        else         dispatch_sparse_prefill.template operator()<false, false>();
+        // Prefill is always causal
+        if (is_bf16) dispatch_sparse_prefill.template operator()<true, true>();
+        else         dispatch_sparse_prefill.template operator()<true, false>();
 
     } else {
         TORCH_CHECK(false, "Unsupported sparse SDP config: hd=", hd,

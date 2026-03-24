@@ -12,6 +12,7 @@ Sparse attention flow:
 """
 from dataclasses import dataclass, field
 from typing import ClassVar
+import os
 
 import torch
 
@@ -40,6 +41,33 @@ INFLLMV2_TOPK = 64             # number of KV blocks selected per token
 INFLLMV2_INIT_BLOCKS = 2       # initial blocks always attended
 INFLLMV2_LOCAL_BLOCKS = 4      # local attention window (in pooled blocks)
 INFLLMV2_DENSE_LEN = 8192      # threshold: use dense below this
+
+# Debug toggles: set to "0" to disable sparse SDP for that phase
+# (pattern detection still runs, but dense SDP is used instead)
+# INFLLMV2_SPARSE_PREFILL=0  → run pattern detection, use dense SDP for prefill
+# INFLLMV2_SPARSE_DECODE=0   → run pattern detection, use dense SDP for decode
+INFLLMV2_USE_SPARSE_PREFILL = os.environ.get("INFLLMV2_SPARSE_PREFILL", "1") != "0"
+# Sparse decode: controllable via env var. Default ON (last-block fix verified).
+INFLLMV2_USE_SPARSE_DECODE = os.environ.get("INFLLMV2_SPARSE_DECODE", "1") != "0"
+INFLLMV2_DEBUG_TRACE = os.environ.get("INFLLMV2_DEBUG_TRACE", "0") != "0"
+_trace_call_count = 0  # module-level counter for sampling
+
+
+def _check_tensor(name: str, t: torch.Tensor, step: int):
+    """Log NaN/inf/stats for a tensor. Used in debug trace."""
+    f = t.float()
+    has_nan = torch.isnan(f).any().item()
+    has_inf = torch.isinf(f).any().item()
+    nan_cnt = int(torch.isnan(f).sum().item()) if has_nan else 0
+    inf_cnt = int(torch.isinf(f).sum().item()) if has_inf else 0
+    mn = f[~torch.isnan(f)].min().item() if not has_nan or f.numel() > nan_cnt else float('nan')
+    mx = f[~torch.isnan(f)].max().item() if not has_nan or f.numel() > nan_cnt else float('nan')
+    avg = f[~torch.isnan(f)].mean().item() if not has_nan or f.numel() > nan_cnt else float('nan')
+    tag = "OK" if not has_nan and not has_inf else "*** BAD ***"
+    logger.info(
+        "DIAG step=%d %s %s shape=%s nan=%d inf=%d "
+        "min=%.4f max=%.4f mean=%.4f",
+        step, name, tag, list(t.shape), nan_cnt, inf_cnt, mn, mx, avg)
 
 
 class InfLLMv2EsimdAttentionBackend(AttentionBackend):
@@ -282,6 +310,17 @@ class InfLLMv2EsimdAttentionImpl(AttentionImpl):
             max_sl, num_pooled_blocks,
             self.kernel_size, self.kernel_stride)
 
+        # NaN/inf check on intermediates
+        if INFLLMV2_DEBUG_TRACE:
+            global _trace_call_count
+            _trace_call_count += 1
+            if _trace_call_count <= 5 or _trace_call_count % 200 == 0:
+                _check_tensor("decode_k_contiguous", k_contiguous,
+                              _trace_call_count)
+                _check_tensor("decode_k_pooled", k_pooled,
+                              _trace_call_count)
+                _check_tensor("decode_query", query, _trace_call_count)
+
         # Step 3: Pattern detection (decode)
         # query shape: [num_tokens, nh, hd] where num_tokens = batch (1 per req)
         q_for_pattern = query.view(batch, nh, hd).unsqueeze(2)  # [B, nh, 1, hd]
@@ -314,26 +353,71 @@ class InfLLMv2EsimdAttentionImpl(AttentionImpl):
             self.init_blocks, self.local_blocks,
             self.topk)
 
-        # Step 4: Sparse decode SDP
-        # topk_output: [batch, nkvh, 1, 64] — these are kv_block indices
-        # Reshape to [batch, nkvh, 64] for the kernel
-        sparse_mask = topk_output.squeeze(2).int()
+        # NaN/inf check on pattern detection outputs
+        if INFLLMV2_DEBUG_TRACE:
+            if _trace_call_count <= 5 or _trace_call_count % 200 == 0:
+                _check_tensor("decode_block_scores", block_scores,
+                              _trace_call_count)
+                _check_tensor("decode_kv_block_scores", kv_block_scores,
+                              _trace_call_count)
+                _check_tensor("decode_pooled_scores", pooled_scores,
+                              _trace_call_count)
+                # Log topk block selection
+                tk = topk_output.cpu()
+                for b in range(min(batch, 2)):
+                    for h in range(nkvh):
+                        blks = sorted(tk[b, h, 0].numpy().tolist())
+                        q_blk = (max_sl - 1) // self.sparse_block
+                        logger.info(
+                            "TRACE decode step=%d b=%d kvh=%d seq=%d "
+                            "q_blk=%d nblks=%d blocks=%s",
+                            _trace_call_count, b, h, max_sl, q_blk,
+                            len(blks), blks[:20])
 
-        # For sparse decode, we pass num_sparse_blocks to the kernel
-        # mask_cnt is not used for decode (only for prefill)
-        dummy_mask_cnt = torch.zeros(1, dtype=torch.int32, device=device)
+        # Step 4: SDP — sparse or dense depending on toggle
+        if INFLLMV2_USE_SPARSE_DECODE:
+            # topk_output: [batch, nkvh, 1, 64] → [batch, nkvh, 64]
+            sparse_mask = topk_output.squeeze(2).int()
 
-        self._esimd_sdp_paged_sparse(
-            query, kv_cache, output,
-            attn_metadata.block_table,
-            attn_metadata.seq_lens,
-            attn_metadata.query_start_loc,
-            sparse_mask, dummy_mask_cnt,
-            nh, nkvh,
-            hd, block_size,
-            max_sl, self.scale,
-            1,  # is_decode=True
-            self.topk)
+            # Force-insert last sparse block: it may have no pooled
+            # representation (num_pooled covers fewer tokens than seq_len)
+            # but the SDP must attend to the current token's block.
+            for b in range(batch):
+                sl = int(seq_lens_cpu[b].item())
+                last_blk = (sl - 1) // self.sparse_block
+                for h in range(nkvh):
+                    row = sparse_mask[b, h]
+                    if not (row == last_blk).any().item():
+                        # Replace the last slot (lowest-priority) with last_blk
+                        sparse_mask[b, h, -1] = last_blk
+                        if INFLLMV2_DEBUG_TRACE:
+                            logger.info(
+                                "DECODE: force-inserted last_blk=%d for "
+                                "b=%d h=%d sl=%d (was not in topk)",
+                                last_blk, b, h, sl)
+
+            dummy_mask_cnt = torch.zeros(1, dtype=torch.int32, device=device)
+
+            self._esimd_sdp_paged_sparse(
+                query, kv_cache, output,
+                attn_metadata.block_table,
+                attn_metadata.seq_lens,
+                attn_metadata.query_start_loc,
+                sparse_mask, dummy_mask_cnt,
+                nh, nkvh,
+                hd, block_size,
+                max_sl, self.scale,
+                1,  # is_decode=True
+                self.topk)
+
+            # Debug: check sparse decode output
+            if INFLLMV2_DEBUG_TRACE:
+                if _trace_call_count <= 5 or _trace_call_count % 200 == 0:
+                    _check_tensor("decode_sparse_output", output[:batch],
+                                  _trace_call_count)
+        else:
+            # Dense fallback (pattern detection ran but we ignore its output)
+            self._forward_dense(query, kv_cache, output, attn_metadata)
 
         return output
 
@@ -404,6 +488,12 @@ class InfLLMv2EsimdAttentionImpl(AttentionImpl):
             max_sl, num_pooled_blocks,
             self.kernel_size, self.kernel_stride)
 
+        # NaN/inf check on prefill intermediates
+        if INFLLMV2_DEBUG_TRACE:
+            _check_tensor("prefill_k_contiguous", k_contiguous, 0)
+            _check_tensor("prefill_k_pooled", k_pooled, 0)
+            _check_tensor("prefill_query", query, 0)
+
         # Step 3: Pattern detection (prefill)
         # Query needs to be in [bsz, nh, seq_len, hd] format for pattern detection
         nh = self.num_heads
@@ -439,6 +529,50 @@ class InfLLMv2EsimdAttentionImpl(AttentionImpl):
             self.init_blocks, self.local_blocks,
             self.topk)
 
+        # NaN/inf check on pattern detection outputs
+        if INFLLMV2_DEBUG_TRACE:
+            _check_tensor("prefill_block_scores", block_scores, 0)
+            _check_tensor("prefill_pooled_scores", pooled_scores, 0)
+
+        # Debug trace: log prefill block selection
+        if INFLLMV2_DEBUG_TRACE:
+            tk = topk_per_token.cpu()  # [1, nkvh, q_len, 64]
+            # Sample a few query positions
+            sample_qs = [0, q_len // 4, q_len // 2, 3 * q_len // 4, q_len - 1]
+            sample_qs = [q for q in sample_qs if q < q_len]
+            for qi in sample_qs:
+                for h in range(nkvh):
+                    blks = tk[0, h, qi].numpy()
+                    sorted_blks = sorted(blks)
+                    q_blk_abs = (qi + cache_len) // self.sparse_block
+                    has_init = [x for x in sorted_blks if x < self.init_blocks]
+                    has_local = [x for x in sorted_blks if q_blk_abs - self.local_blocks <= x <= q_blk_abs]
+                    logger.info(
+                        "TRACE prefill q=%d/%d kvh=%d seq=%d q_blk=%d "
+                        "cache_len=%d init_blks=%s local_blks=%s "
+                        "topk_range=[%d,%d] blocks=%s",
+                        qi, q_len, h, max_sl, q_blk_abs,
+                        cache_len, has_init, has_local,
+                        min(sorted_blks), max(sorted_blks),
+                        sorted_blks[:20])
+            # Also log k_pooled stats
+            kp_cpu = k_pooled.cpu().float()
+            logger.info(
+                "TRACE prefill k_pooled shape=%s mean=%.4f std=%.4f "
+                "min=%.4f max=%.4f nonzero=%d/%d",
+                list(k_pooled.shape),
+                kp_cpu.mean().item(), kp_cpu.std().item(),
+                kp_cpu.min().item(), kp_cpu.max().item(),
+                (kp_cpu.abs() > 1e-6).sum().item(), kp_cpu.numel())
+            # Log pooled_scores stats
+            ps_cpu = pooled_scores.cpu().float()
+            logger.info(
+                "TRACE prefill pooled_scores shape=%s mean=%.6f std=%.6f "
+                "min=%.6f max=%.6f",
+                list(pooled_scores.shape),
+                ps_cpu.mean().item(), ps_cpu.std().item(),
+                ps_cpu.min().item(), ps_cpu.max().item())
+
         # Step 4: Mask convert (per-token → per-q-block union)
         # topk_per_token: [1, nkvh, q_len, 64] -> reshape to [nkvh, q_len, 64]
         mask_orig = topk_per_token.squeeze(0).int()
@@ -458,118 +592,69 @@ class InfLLMv2EsimdAttentionImpl(AttentionImpl):
             mask_orig, mask_out, mask_cnt_out,
             q_len, nkvh, total_kv_blocks)
 
-        # Step 5: Sparse prefill SDP
-        sparse_mask_cnt = mask_cnt_out.int()
-        sparse_mask = mask_out.int()
+        if INFLLMV2_DEBUG_TRACE:
+            mc = mask_cnt_out.cpu()
+            mo = mask_out.cpu()
+            logger.info(
+                "TRACE mask_convert q_blocks=%d total_kv_blocks=%d "
+                "mask_cnt: min=%d max=%d mean=%.1f",
+                q_blocks, total_kv_blocks,
+                mc.min().item(), mc.max().item(), mc.float().mean().item())
+            # Show first and last q_block's selected blocks
+            for qb_idx in [0, q_blocks - 1]:
+                for h in range(nkvh):
+                    cnt = int(mc[h, qb_idx].item())
+                    blks = mo[h, qb_idx, :cnt].numpy().tolist()
+                    logger.info(
+                        "TRACE mask_convert kvh=%d qblk=%d cnt=%d "
+                        "blocks=%s",
+                        h, qb_idx, cnt, blks[:30])
 
-        # Debug: check mask stats
-        mask_cnt_cpu = mask_cnt_out.cpu()
-        logger.info(
-            "Sparse prefill mask stats: q_blocks=%d, "
-            "mask_cnt min=%d max=%d mean=%.1f, "
-            "topk_min=%d topk_max=%d, "
-            "num_pooled_blocks=%d, num_pooled_out=%d, "
-            "total_kv_blocks=%d",
-            q_blocks,
-            int(mask_cnt_cpu.min().item()),
-            int(mask_cnt_cpu.max().item()),
-            float(mask_cnt_cpu.float().mean().item()),
-            int(topk_per_token.min().item()),
-            int(topk_per_token.max().item()),
-            num_pooled_blocks, num_pooled_out,
-            total_kv_blocks)
+        # Step 5: SDP — sparse or dense depending on toggle
+        if INFLLMV2_USE_SPARSE_PREFILL:
+            sparse_mask_cnt = mask_cnt_out.int()
+            sparse_mask = mask_out.int()
+            qsl = torch.tensor([0, q_len], dtype=torch.int32, device=device)
 
-        # query_start_loc for single request
-        qsl = torch.tensor([0, q_len], dtype=torch.int32, device=device)
-
-        self._esimd_sdp_paged_sparse(
-            query[:q_len], kv_cache, output[:q_len],
-            attn_metadata.block_table,
-            attn_metadata.seq_lens,
-            qsl,
-            sparse_mask, sparse_mask_cnt,
-            nh, nkvh,
-            hd, block_size,
-            max_sl, self.scale,
-            0,  # is_decode=False
-            self.topk)
-
-        # Debug: compare sparse (all-blocks mask) vs dense output
-        if not hasattr(self, '_debug_compared'):
-            self._debug_compared = True
-
-            sparse_out = output[:q_len].clone()
-
-            # Test with ALL blocks mask to isolate kernel vs mask issue
-            all_blocks_mask = torch.zeros(
-                nkvh, q_blocks, 1024,
-                dtype=torch.int32, device=device)
-            all_blocks_cnt = torch.zeros(
-                nkvh, q_blocks,
-                dtype=torch.int32, device=device)
-
-            # Fill mask with all block IDs [0, total_kv_blocks-1]
-            for h_idx in range(nkvh):
-                for qb in range(q_blocks):
-                    all_blocks_mask[h_idx, qb, :total_kv_blocks] = \
-                        torch.arange(total_kv_blocks, dtype=torch.int32,
-                                     device=device)
-                    all_blocks_cnt[h_idx, qb] = total_kv_blocks
-
-            allblk_out = torch.zeros_like(output[:q_len])
             self._esimd_sdp_paged_sparse(
-                query[:q_len], kv_cache, allblk_out,
+                query[:q_len], kv_cache, output[:q_len],
                 attn_metadata.block_table,
                 attn_metadata.seq_lens,
                 qsl,
-                all_blocks_mask, all_blocks_cnt,
+                sparse_mask, sparse_mask_cnt,
                 nh, nkvh,
                 hd, block_size,
                 max_sl, self.scale,
                 0,  # is_decode=False
-                total_kv_blocks)
+                self.topk)
 
-            # Run dense reference
-            dense_out = torch.zeros_like(output[:q_len])
-            self._esimd_sdp_paged(
-                query[:q_len], kv_cache, dense_out,
-                attn_metadata.block_table,
-                attn_metadata.seq_lens,
-                qsl,
-                nh, nkvh,
-                hd, block_size,
-                max_sl, self.scale,
-                1,  # causal=True
-            )
-
-            # Compare sparse(original) vs dense
-            diff_sparse = (sparse_out.float() - dense_out.float()).abs()
-            logger.info(
-                "Sparse(topk) vs Dense: abs_diff mean=%.6f max=%.6f",
-                float(diff_sparse.mean().item()),
-                float(diff_sparse.max().item()))
-
-            # Compare sparse(all-blocks) vs dense
-            diff_all = (allblk_out.float() - dense_out.float()).abs()
-            logger.info(
-                "Sparse(all-blocks) vs Dense: abs_diff mean=%.6f max=%.6f",
-                float(diff_all.mean().item()),
-                float(diff_all.max().item()))
-
-            # Per-Q comparison for first 4 positions
-            for qi in range(min(4, q_len)):
-                d = dense_out[qi].float()
-                a = allblk_out[qi].float()
-                s = sparse_out[qi].float()
-                logger.info(
-                    "  Q[%d]: dense_norm=%.4f allblk_norm=%.4f "
-                    "sparse_norm=%.4f diff_allblk=%.6f diff_sparse=%.6f",
-                    qi,
-                    float(d.norm().item()),
-                    float(a.norm().item()),
-                    float(s.norm().item()),
-                    float((a - d).abs().mean().item()),
-                    float((s - d).abs().mean().item()))
+            # Debug: check for NaN in sparse prefill output
+            if INFLLMV2_DEBUG_TRACE:
+                o_check = output[:q_len]  # [q_len, nh, hd]
+                nan_per_row = torch.isnan(o_check).any(dim=-1).any(dim=-1)  # [q_len]
+                nan_rows = nan_per_row.nonzero(as_tuple=False).squeeze(-1)
+                if nan_rows.numel() > 0:
+                    first_r = int(nan_rows[0].item())
+                    last_r = int(nan_rows[-1].item())
+                    nr = nan_rows.numel()
+                    # Check which heads have NaN at first_r
+                    first_row_nan = torch.isnan(o_check[first_r]).any(dim=-1)
+                    nan_heads = first_row_nan.nonzero(as_tuple=False).squeeze(-1).tolist()
+                    logger.info(
+                        "TRACE sparse_prefill: NaN rows=%d first=%d last=%d "
+                        "q_len=%d last_blk_start=%d "
+                        "first_row_nan_heads=%s",
+                        nr, first_r, last_r, q_len,
+                        (q_len // 16) * 16, str(nan_heads[:10]))
+                else:
+                    logger.info(
+                        "TRACE sparse_prefill: OK mean=%.4f abs_max=%.4f",
+                        o_check.float().mean().item(),
+                        o_check.float().abs().max().item())
+        else:
+            # Dense fallback (pattern detection ran but we ignore its output)
+            self._forward_dense(
+                query[:q_len], kv_cache, output[:q_len], attn_metadata)
 
         return output
 
@@ -602,19 +687,29 @@ class InfLLMv2EsimdAttentionImpl(AttentionImpl):
             # Short sequence: use dense attention
             self._forward_dense(q_slice, kv_cache, o_slice, attn_metadata)
         elif is_decode:
-            # Long decode: sparse attention
-            logger.info_once(
-                "InfLLMv2 sparse decode activated: max_seq_len=%d, "
-                "batch=%d, num_tokens=%d",
-                max_seq_len, attn_metadata.seq_lens.shape[0],
-                num_actual_tokens)
-            self._forward_sparse_decode(
-                q_slice, kv_cache, o_slice, attn_metadata)
+            if not INFLLMV2_USE_SPARSE_DECODE:
+                # Sparse decode disabled — skip pattern detection entirely
+                logger.info_once(
+                    "InfLLMv2 decode: dense fallback (max_seq_len=%d)",
+                    max_seq_len)
+                self._forward_dense(
+                    q_slice, kv_cache, o_slice, attn_metadata)
+            else:
+                # Long decode: pattern detection + sparse SDP
+                logger.info_once(
+                    "InfLLMv2 decode path: max_seq_len=%d, batch=%d, "
+                    "sparse_sdp=%s",
+                    max_seq_len, attn_metadata.seq_lens.shape[0],
+                    INFLLMV2_USE_SPARSE_DECODE)
+                self._forward_sparse_decode(
+                    q_slice, kv_cache, o_slice, attn_metadata)
         else:
-            # Long prefill: sparse prefill
+            # Long prefill: pattern detection + sparse/dense SDP
             logger.info_once(
-                "InfLLMv2 sparse prefill activated: max_seq_len=%d, "
-                "q_len=%d", max_seq_len, num_actual_tokens)
+                "InfLLMv2 prefill path: max_seq_len=%d, q_len=%d, "
+                "sparse_sdp=%s",
+                max_seq_len, num_actual_tokens,
+                INFLLMV2_USE_SPARSE_PREFILL)
             self._forward_sparse_prefill(
                 q_slice, kv_cache, o_slice, attn_metadata)
 
