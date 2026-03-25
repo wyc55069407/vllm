@@ -155,6 +155,7 @@ _TEXT_GENERATION_MODELS = {
     "Mamba2ForCausalLM": ("mamba2", "Mamba2ForCausalLM"),
     "MiniCPMForCausalLM": ("minicpm", "MiniCPMForCausalLM"),
     "MiniCPM3ForCausalLM": ("minicpm3", "MiniCPM3ForCausalLM"),
+    "MiniCPM5MoEForCausalLM": ("minicpm5_moe", "MiniCPM5MoEForCausalLM"),
     "MiniMaxForCausalLM": ("minimax_text_01", "MiniMaxText01ForCausalLM"),
     "MiniMaxText01ForCausalLM": ("minimax_text_01", "MiniMaxText01ForCausalLM"),
     "MiniMaxM1ForCausalLM": ("minimax_text_01", "MiniMaxText01ForCausalLM"),
