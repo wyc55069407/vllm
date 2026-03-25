@@ -307,7 +307,23 @@ def test_sparse_decode_correctness(batch, seq_len, dtype=torch.bfloat16):
     return status == "PASS"
 
 
-def bench_sparse_prefill(q_len, seq_len, n_sparse_blocks, dtype=torch.bfloat16, warmup=5, iters=20):
+def build_sparse_mask_prefill_sequential(q_len, seq_len, nkvh, n_sparse_blocks, sparse_block=64):
+    """Build sparse mask with sequential block indices 0..n-1 (best-case cache pattern)."""
+    q_blocks = (q_len + 15) // 16
+    total_kv_blocks = (seq_len + sparse_block - 1) // sparse_block
+    n = min(n_sparse_blocks, total_kv_blocks)
+
+    mask = torch.zeros(nkvh, q_blocks, 1024, dtype=torch.int32, device='xpu')
+    mask_cnt = torch.full((nkvh, q_blocks), n, dtype=torch.int32, device='xpu')
+    for kvh in range(nkvh):
+        for qb in range(q_blocks):
+            for i in range(n):
+                mask[kvh, qb, i] = i
+    return mask, mask_cnt
+
+
+def bench_sparse_prefill(q_len, seq_len, n_sparse_blocks, dtype=torch.bfloat16,
+                         warmup=5, iters=20, sequential_mask=False):
     """Benchmark sparse prefill TFLOPS."""
     nh, nkvh, hd, bs = 32, 2, 128, 128
     scale = 1.0 / math.sqrt(hd)
@@ -315,7 +331,10 @@ def bench_sparse_prefill(q_len, seq_len, n_sparse_blocks, dtype=torch.bfloat16, 
 
     kv_cache, bt, sl = create_paged_kv_cache(seq_len, nkvh, hd, bs, 'xpu', dtype, data_scale=0.5)
     q = (torch.randn(q_len, nh, hd, dtype=dtype, device='xpu') * 0.5)
-    mask, mask_cnt = build_sparse_mask_prefill(q_len, seq_len, nkvh, n_sparse_blocks)
+    if sequential_mask:
+        mask, mask_cnt = build_sparse_mask_prefill_sequential(q_len, seq_len, nkvh, n_sparse_blocks)
+    else:
+        mask, mask_cnt = build_sparse_mask_prefill(q_len, seq_len, nkvh, n_sparse_blocks)
 
     # Warmup
     for _ in range(warmup):
@@ -385,10 +404,17 @@ def bench_sparse_decode(batch, seq_len, dtype=torch.bfloat16, warmup=10, iters=5
 # ---------- main ----------
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Sparse SDP correctness + perf test")
-    parser.add_argument("--skip-correctness", action="store_true")
+    parser.add_argument("--skip-correctness", action="store_true",
+                        help="Skip slow correctness tests (PyTorch reference)")
     parser.add_argument("--skip-perf", action="store_true")
+    parser.add_argument("--perf-only", action="store_true",
+                        help="Alias for --skip-correctness")
+    parser.add_argument("--sequential-mask", action="store_true",
+                        help="Use sequential block indices 0..N (best-case cache, peak TFLOPS)")
     parser.add_argument("--dtype", default="bf16", choices=["bf16", "fp16"])
     args = parser.parse_args()
+    if args.perf_only:
+        args.skip_correctness = True
 
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
     dtype_name = "bf16" if dtype == torch.bfloat16 else "fp16"
@@ -426,8 +452,9 @@ if __name__ == '__main__':
         print(f"\n  Overall: {'ALL PASS' if all_pass else 'SOME FAILED'}")
 
     if not args.skip_perf:
+        mask_label = "sequential" if args.sequential_mask else "scattered (realistic)"
         print(f"\n{'='*60}")
-        print(f"  Sparse Prefill Performance ({dtype_name})")
+        print(f"  Sparse Prefill Performance ({dtype_name}, mask={mask_label})")
         print(f"  flops = q_len x nh(32) x kv_attended x hd(128) x 4")
         print(f"{'='*60}")
         for q_len, seq_len, nsb in [
@@ -446,7 +473,7 @@ if __name__ == '__main__':
             (8192, 131072, 128),
             (8192, 131072, 256),
         ]:
-            bench_sparse_prefill(q_len, seq_len, nsb, dtype)
+            bench_sparse_prefill(q_len, seq_len, nsb, dtype, sequential_mask=args.sequential_mask)
 
         print(f"\n{'='*60}")
         print(f"  Sparse Decode Performance ({dtype_name})")
