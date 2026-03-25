@@ -49,6 +49,7 @@ ESIMD_INLINE void infllmv2_k_pooling_paged(
     int max_blocks_per_seq,
     int page_size,                                    // vLLM block_size (128)
     int num_pooled_blocks,
+    int start_pooled_block,                           // skip blocks before this (for incremental update)
     int64_t kv_stride_block,                          // stride per page block (elements)
     sycl::id<3> idx
 ) {
@@ -57,6 +58,7 @@ ESIMD_INLINE void infllmv2_k_pooling_paged(
     int block_idx   = idx[2];
 
     if (block_idx >= num_pooled_blocks) return;
+    if (block_idx < start_pooled_block) return;
 
     int seq_len = seq_lens_ptr[batch_idx];
     const int* bt_row = block_table_ptr + batch_idx * max_blocks_per_seq;

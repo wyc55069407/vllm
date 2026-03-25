@@ -570,13 +570,18 @@ def esimd_infllmv2_k_pooling_paged(
     num_kv_heads: int, head_dim: int,
     page_size: int, num_pooled_blocks: int,
     kernel_size: int, kernel_stride: int,
+    start_pooled_block: int = 0,
 ) -> torch.Tensor:
-    """InfLLMv2 paged K pooling: reads K directly from paged KV cache via block_table."""
+    """InfLLMv2 paged K pooling: reads K directly from paged KV cache via block_table.
+
+    start_pooled_block: skip blocks before this index (for incremental update).
+    """
     return _ops.esimd_infllmv2_k_pooling_paged(
         kv_cache, key_pooled, block_table, seq_lens,
         num_kv_heads, head_dim,
         page_size, num_pooled_blocks,
-        kernel_size, kernel_stride)
+        kernel_size, kernel_stride,
+        start_pooled_block)
 
 
 def esimd_infllmv2_force_last_block(

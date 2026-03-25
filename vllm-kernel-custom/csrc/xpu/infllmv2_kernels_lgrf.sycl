@@ -464,7 +464,8 @@ at::Tensor esimd_infllmv2_k_pooling_paged(
     int64_t num_kv_heads, int64_t head_dim,
     int64_t page_size,
     int64_t num_pooled_blocks,
-    int64_t kernel_size, int64_t kernel_stride)
+    int64_t kernel_size, int64_t kernel_stride,
+    int64_t start_pooled_block)        // skip blocks before this (0 = full recompute)
 {
     auto stream = at::xpu::getCurrentXPUStream();
     auto& dpcpp_queue = stream.queue();
@@ -473,6 +474,7 @@ at::Tensor esimd_infllmv2_k_pooling_paged(
     int mbps = (int)block_table.size(1);
     int ps = (int)page_size;
     int npb = (int)num_pooled_blocks;
+    int spb = (int)start_pooled_block;
 
     auto* kv_ptr = reinterpret_cast<const unsigned short*>(kv_cache.data_ptr());
     auto* kp_ptr = reinterpret_cast<fp16*>(key_pooled.data_ptr());
@@ -493,7 +495,7 @@ at::Tensor esimd_infllmv2_k_pooling_paged(
                 [=](sycl::id<3> idx) SYCL_ESIMD_KERNEL {
                 infllmv2_k_pooling_paged<2, 128, 32, 16, BF16>(
                     kv_ptr, bt_ptr, sl_ptr, kp_ptr,
-                    mbps, ps, npb,
+                    mbps, ps, npb, spb,
                     kv_s1, idx);
             });
         });

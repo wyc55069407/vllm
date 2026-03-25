@@ -107,7 +107,8 @@ TORCH_LIBRARY_FRAGMENT(vllm_kernel_custom, m) {
         "Tensor block_table, Tensor seq_lens, "
         "int num_kv_heads, int head_dim, "
         "int page_size, int num_pooled_blocks, "
-        "int kernel_size, int kernel_stride) -> Tensor");
+        "int kernel_size, int kernel_stride, "
+        "int start_pooled_block) -> Tensor");
   m.impl("esimd_infllmv2_k_pooling_paged", torch::kXPU, &esimd_infllmv2_k_pooling_paged);
 
   /* === InfLLMv2 Force Last Block === */

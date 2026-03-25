@@ -76,7 +76,7 @@ def bench_decode_pipeline(seq_len, batch=1):
     t_pool = time_kernel(lambda: esimd_infllmv2_k_pooling_paged(
         kv_cache, k_pooled, bt_padded, sl,
         nkvh, hd, block_size, num_pooled_blocks,
-        kernel_size, kernel_stride))
+        kernel_size, kernel_stride, 0))
 
     # 2. Pattern detection (decode)
     t_pattern = time_kernel(lambda: esimd_infllmv2_pattern_decode(
@@ -149,7 +149,7 @@ def bench_prefill_pipeline(seq_len, q_len=None):
     t_pool = time_kernel(lambda: esimd_infllmv2_k_pooling_paged(
         kv_cache, k_pooled, bt_padded, sl,
         nkvh, hd, block_size, num_pooled_blocks,
-        kernel_size, kernel_stride))
+        kernel_size, kernel_stride, 0))
 
     # 2. Pattern detection (prefill)
     t_pattern = time_kernel(lambda: esimd_infllmv2_pattern_prefill(

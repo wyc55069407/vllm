@@ -41,7 +41,7 @@ def test_k_pooling_paged():
             kv_cache, k_pooled_paged,
             bt_padded, seq_lens,
             nkvh, hd, page_size, num_pooled,
-            kernel_size, kernel_stride)
+            kernel_size, kernel_stride, 0)
 
         # Method 2: Extract contiguous K + old K pooling
         k_contiguous = torch.zeros(batch, nkvh, seq_len, hd,
@@ -114,11 +114,65 @@ def test_force_last_block():
             print(f"  [{'PASS' if match else 'FAIL'}] Already-present test: unchanged={match}")
 
 
+def test_incremental_k_pooling():
+    """Verify incremental pooling (start_pooled_block>0) matches full recompute."""
+    nkvh, hd = 2, 128
+    page_size = 128
+    kernel_size, kernel_stride = 32, 16
+    batch = 1
+
+    for seq_len in [4096, 8192, 16384]:
+        num_pages = (seq_len + page_size - 1) // page_size
+        num_pooled = (seq_len - kernel_size + kernel_stride) // kernel_stride
+        total_pages = num_pages + 4
+
+        kv_cache = torch.randn(2, total_pages, page_size, nkvh, hd,
+                               dtype=torch.bfloat16, device='xpu') * 0.3
+        bt_padded = torch.zeros(1, total_pages, dtype=torch.int32, device='xpu')
+        bt_padded[0, :num_pages] = torch.arange(num_pages, dtype=torch.int32, device='xpu')
+        seq_lens = torch.tensor([seq_len], dtype=torch.int32, device='xpu')
+
+        # Full recompute (start_pooled_block=0)
+        k_full = torch.zeros(batch, nkvh, num_pooled, hd,
+                             dtype=torch.float16, device='xpu')
+        esimd_infllmv2_k_pooling_paged(
+            kv_cache, k_full, bt_padded, seq_lens,
+            nkvh, hd, page_size, num_pooled,
+            kernel_size, kernel_stride, 0)
+
+        # Incremental: compute first N-2 blocks, then last 2
+        start_block = max(0, num_pooled - 2)
+        k_incr = torch.zeros(batch, nkvh, num_pooled, hd,
+                             dtype=torch.float16, device='xpu')
+        # First pass: blocks 0..start_block-1
+        esimd_infllmv2_k_pooling_paged(
+            kv_cache, k_incr, bt_padded, seq_lens,
+            nkvh, hd, page_size, num_pooled,
+            kernel_size, kernel_stride, 0)
+        # Corrupt tail blocks to prove incremental overwrites them
+        k_incr[:, :, start_block:, :] = 999.0
+        # Incremental pass: only blocks start_block..end
+        esimd_infllmv2_k_pooling_paged(
+            kv_cache, k_incr, bt_padded, seq_lens,
+            nkvh, hd, page_size, num_pooled,
+            kernel_size, kernel_stride, start_block)
+        torch.xpu.synchronize()
+
+        diff = (k_full.float() - k_incr.float()).abs()
+        max_diff = diff.max().item()
+        status = "PASS" if max_diff < 1e-6 else "FAIL"
+        print(f"  [{status}] seq_len={seq_len:6d}  num_pooled={num_pooled:4d}  "
+              f"start_block={start_block}  max_diff={max_diff:.6f}")
+
+
 if __name__ == '__main__':
     print("=== Paged K Pooling Correctness ===")
     test_k_pooling_paged()
     print()
     print("=== Force Last Block Correctness ===")
     test_force_last_block()
+    print()
+    print("=== Incremental K Pooling Correctness ===")
+    test_incremental_k_pooling()
     print()
     print("Done.")

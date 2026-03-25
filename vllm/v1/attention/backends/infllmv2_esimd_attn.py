@@ -193,9 +193,21 @@ class InfLLMv2EsimdAttentionImpl(AttentionImpl):
         self.init_blocks = INFLLMV2_INIT_BLOCKS
         self.local_blocks = INFLLMV2_LOCAL_BLOCKS
 
-        # Per-layer compressed K state (lazily initialized)
-        self._pooled_k: dict[int, torch.Tensor] = {}  # req_idx -> pooled_k
-        self._pooled_k_len: dict[int, int] = {}        # req_idx -> num_blocks
+        # Per-layer incremental K pooling state (keyed by batch index)
+        # Cached across decode steps to avoid full recomputation
+        self._cached_pooled_k: dict[int, torch.Tensor] = {}  # batch_idx -> pooled_k
+        self._cached_seq_len: dict[int, int] = {}             # batch_idx -> seq_len when cached
+
+        # Pre-allocated decode buffers (lazily sized on first use)
+        self._decode_bufs_ready = False
+        self._decode_batch = 0
+        self._decode_num_pooled_blocks = 0
+        self._decode_num_pooled = 0
+        self._buf_block_scores = None
+        self._buf_kv_block_scores = None
+        self._buf_pooled_scores = None
+        self._buf_topk_output = None
+        self._buf_dummy_mask_cnt = None
 
         # Lazy kernel imports
         self._kernels_loaded = False
@@ -259,6 +271,40 @@ class InfLLMv2EsimdAttentionImpl(AttentionImpl):
         )
         return output
 
+    def _ensure_decode_bufs(self, batch, num_pooled_blocks, num_pooled, device):
+        """Pre-allocate decode intermediate buffers (reused across steps)."""
+        if (self._decode_bufs_ready
+                and self._decode_batch >= batch
+                and self._decode_num_pooled_blocks >= num_pooled_blocks
+                and self._decode_num_pooled >= num_pooled):
+            # Buffers are large enough — zero only the used portions
+            self._buf_block_scores[:batch, :, :, :num_pooled_blocks].zero_()
+            self._buf_kv_block_scores[:batch, :, :, :num_pooled_blocks].zero_()
+            self._buf_pooled_scores[:batch, :, :, :num_pooled].zero_()
+            self._buf_topk_output[:batch, :, :, :].zero_()
+            return
+
+        nh, nkvh, hd = self.num_heads, self.num_kv_heads, self.head_size
+        self._decode_batch = batch
+        self._decode_num_pooled_blocks = num_pooled_blocks
+        self._decode_num_pooled = num_pooled
+        self._buf_block_scores = torch.zeros(
+            batch, nh, 1, num_pooled_blocks,
+            dtype=torch.float16, device=device)
+        self._buf_kv_block_scores = torch.zeros(
+            batch, nkvh, 1, num_pooled_blocks,
+            dtype=torch.float16, device=device)
+        self._buf_pooled_scores = torch.zeros(
+            batch, nkvh, 1, num_pooled,
+            dtype=torch.float16, device=device)
+        self._buf_topk_output = torch.zeros(
+            batch, nkvh, 1, self.topk,
+            dtype=torch.int32, device=device)
+        if self._buf_dummy_mask_cnt is None:
+            self._buf_dummy_mask_cnt = torch.zeros(
+                1, dtype=torch.int32, device=device)
+        self._decode_bufs_ready = True
+
     def _forward_sparse_decode(
         self,
         query: torch.Tensor,
@@ -266,9 +312,11 @@ class InfLLMv2EsimdAttentionImpl(AttentionImpl):
         output: torch.Tensor,
         attn_metadata: InfLLMv2EsimdAttentionMetadata,
     ) -> torch.Tensor:
-        """Sparse decode: k_pool_paged → pattern_detect → topk → force_last_block → sparse SDP.
+        """Sparse decode with incremental K pooling and pre-allocated buffers.
 
-        All operations on GPU — no CPU waits or .item() calls.
+        Caches pooled_k across decode steps. Only recomputes tail 2 pooled
+        blocks when seq_len increments by 1 (typical decode). Falls back to
+        full recompute on mismatch (new request, after prefill, etc.).
         """
         batch = attn_metadata.seq_lens.shape[0]
         block_size = kv_cache.shape[2]
@@ -286,18 +334,50 @@ class InfLLMv2EsimdAttentionImpl(AttentionImpl):
         num_pooled = max(
             1, (num_pooled_blocks + pooling_stride - 1) // pooling_stride)
 
-        # Step 1: Paged K pooling — reads directly from paged KV cache
-        k_pooled = torch.zeros(
-            batch, nkvh, num_pooled_blocks, hd,
-            dtype=torch.float16, device=device)
+        # Step 1: Incremental K pooling
+        # Check if we can reuse cached pooled_k (batch=1 typical case)
+        cached_sl = self._cached_seq_len.get(0, 0)
+        if (batch == 1 and cached_sl > 0 and max_sl == cached_sl + 1
+                and 0 in self._cached_pooled_k):
+            # Incremental: reuse cached, update only tail blocks
+            old_k = self._cached_pooled_k[0]
+            old_npb = old_k.shape[2]
+            if old_npb < num_pooled_blocks:
+                # pooled_k grew by 1 block — extend
+                k_pooled = torch.zeros(
+                    1, nkvh, num_pooled_blocks, hd,
+                    dtype=torch.float16, device=device)
+                k_pooled[:, :, :old_npb, :] = old_k
+            else:
+                k_pooled = old_k
+            # Recompute only last 2 blocks (affected by new token)
+            start_block = max(0, num_pooled_blocks - 2)
+            self._esimd_k_pooling_paged(
+                kv_cache, k_pooled,
+                attn_metadata.block_table,
+                attn_metadata.seq_lens,
+                nkvh, hd,
+                block_size, num_pooled_blocks,
+                self.kernel_size, self.kernel_stride,
+                start_block)
+        else:
+            # Full recompute (first decode, batch>1, or mismatch)
+            k_pooled = torch.zeros(
+                batch, nkvh, num_pooled_blocks, hd,
+                dtype=torch.float16, device=device)
+            self._esimd_k_pooling_paged(
+                kv_cache, k_pooled,
+                attn_metadata.block_table,
+                attn_metadata.seq_lens,
+                nkvh, hd,
+                block_size, num_pooled_blocks,
+                self.kernel_size, self.kernel_stride,
+                0)
 
-        self._esimd_k_pooling_paged(
-            kv_cache, k_pooled,
-            attn_metadata.block_table,
-            attn_metadata.seq_lens,
-            nkvh, hd,
-            block_size, num_pooled_blocks,
-            self.kernel_size, self.kernel_stride)
+        # Cache for next decode step
+        if batch == 1:
+            self._cached_pooled_k[0] = k_pooled
+            self._cached_seq_len[0] = max_sl
 
         # NaN/inf check on intermediates
         if INFLLMV2_DEBUG_TRACE:
@@ -308,30 +388,21 @@ class InfLLMv2EsimdAttentionImpl(AttentionImpl):
                               _trace_call_count)
                 _check_tensor("decode_query", query, _trace_call_count)
 
-        # Step 2: Pattern detection (decode)
+        # Step 2: Pattern detection (decode) — use pre-allocated buffers
         q_for_pattern = query.view(batch, nh, hd).unsqueeze(2)  # [B, nh, 1, hd]
         if q_for_pattern.dtype != torch.float16:
             q_for_pattern = q_for_pattern.half()
 
-        block_scores = torch.zeros(
-            batch, nh, 1, num_pooled_blocks,
-            dtype=torch.float16, device=device)
-        kv_block_scores = torch.zeros(
-            batch, nkvh, 1, num_pooled_blocks,
-            dtype=torch.float16, device=device)
-        pooled_scores = torch.zeros(
-            batch, nkvh, 1, num_pooled,
-            dtype=torch.float16, device=device)
-        topk_output = torch.zeros(
-            batch, nkvh, 1, self.topk,
-            dtype=torch.int32, device=device)
+        self._ensure_decode_bufs(batch, num_pooled_blocks, num_pooled, device)
 
         cache_len = max_sl - 1  # history before this token
 
         self._esimd_pattern_decode(
             q_for_pattern, k_pooled,
-            block_scores, kv_block_scores,
-            pooled_scores, topk_output,
+            self._buf_block_scores[:batch, :, :, :num_pooled_blocks],
+            self._buf_kv_block_scores[:batch, :, :, :num_pooled_blocks],
+            self._buf_pooled_scores[:batch, :, :, :num_pooled],
+            self._buf_topk_output[:batch],
             nh, nkvh,
             1, num_pooled_blocks,
             hd, num_pooled,
@@ -342,31 +413,26 @@ class InfLLMv2EsimdAttentionImpl(AttentionImpl):
         # NaN/inf check on pattern detection outputs
         if INFLLMV2_DEBUG_TRACE:
             if _trace_call_count <= 5 or _trace_call_count % 200 == 0:
-                _check_tensor("decode_block_scores", block_scores,
-                              _trace_call_count)
-                _check_tensor("decode_kv_block_scores", kv_block_scores,
-                              _trace_call_count)
-                _check_tensor("decode_pooled_scores", pooled_scores,
+                _check_tensor("decode_block_scores",
+                              self._buf_block_scores[:batch],
                               _trace_call_count)
 
         # Step 3: SDP — sparse or dense depending on toggle
         if INFLLMV2_USE_SPARSE_DECODE:
             # topk_output: [batch, nkvh, 1, 64] → [batch, nkvh, 64]
-            sparse_mask = topk_output.squeeze(2).int()
+            sparse_mask = self._buf_topk_output[:batch].squeeze(2).int()
 
             # Force-insert last sparse block on GPU (no CPU sync)
             self._esimd_force_last_block(
                 sparse_mask, attn_metadata.seq_lens,
                 nkvh, self.sparse_block)
 
-            dummy_mask_cnt = torch.zeros(1, dtype=torch.int32, device=device)
-
             self._esimd_sdp_paged_sparse(
                 query, kv_cache, output,
                 attn_metadata.block_table,
                 attn_metadata.seq_lens,
                 attn_metadata.query_start_loc,
-                sparse_mask, dummy_mask_cnt,
+                sparse_mask, self._buf_dummy_mask_cnt,
                 nh, nkvh,
                 hd, block_size,
                 max_sl, self.scale,
@@ -419,7 +485,13 @@ class InfLLMv2EsimdAttentionImpl(AttentionImpl):
             attn_metadata.seq_lens,
             nkvh, hd,
             block_size, num_pooled_blocks,
-            self.kernel_size, self.kernel_stride)
+            self.kernel_size, self.kernel_stride,
+            0)  # start_pooled_block=0 (full compute)
+
+        # Cache pooled_k for subsequent decode steps (incremental update)
+        if batch == 1:
+            self._cached_pooled_k[0] = k_pooled
+            self._cached_seq_len[0] = max_sl
 
         # NaN/inf check on prefill intermediates
         if INFLLMV2_DEBUG_TRACE:
@@ -733,6 +805,9 @@ class InfLLMv2EsimdAttentionImpl(AttentionImpl):
                 self._forward_sparse_decode(
                     q_slice, kv_cache, o_slice, attn_metadata)
         else:
+            # Long prefill: clear incremental cache (prefill recomputes all)
+            self._cached_pooled_k.clear()
+            self._cached_seq_len.clear()
             # Long prefill: pattern detection + sparse/dense SDP
             logger.info_once(
                 "InfLLMv2 prefill path: max_seq_len=%d, q_len=%d, "

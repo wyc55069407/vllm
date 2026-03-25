@@ -119,7 +119,7 @@ def bench_decode_new(kv_cache, block_table, seq_lens, query,
         esimd_infllmv2_k_pooling_paged(
             kv_cache, k_pooled, block_table, seq_lens,
             nkvh, hd, block_size, num_pooled_blocks,
-            kernel_size, kernel_stride)
+            kernel_size, kernel_stride, 0)
 
         # Step 2: Pattern detection
         q_for_pattern = query.view(batch, nh, hd).unsqueeze(2).half()

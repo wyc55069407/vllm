@@ -303,7 +303,8 @@ at::Tensor esimd_infllmv2_k_pooling_paged(
     at::Tensor block_table, at::Tensor seq_lens,
     int64_t num_kv_heads, int64_t head_dim,
     int64_t page_size, int64_t num_pooled_blocks,
-    int64_t kernel_size, int64_t kernel_stride);
+    int64_t kernel_size, int64_t kernel_stride,
+    int64_t start_pooled_block);
 
 // InfLLMv2 force last block insertion (large GRF)
 at::Tensor esimd_infllmv2_force_last_block(
