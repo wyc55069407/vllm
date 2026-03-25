@@ -53,6 +53,8 @@ from vllm_kernel_custom.esimd_ops import (
     esimd_infllmv2_pattern_prefill,
     esimd_infllmv2_pattern_decode,
     esimd_infllmv2_mask_convert,
+    esimd_infllmv2_k_pooling_paged,
+    esimd_infllmv2_force_last_block,
 )
 
 from vllm_kernel_custom.version import __version__

@@ -297,6 +297,19 @@ at::Tensor esimd_infllmv2_mask_convert(
     at::Tensor mask_orig, at::Tensor mask_out, at::Tensor mask_cnt_out,
     int64_t qlen, int64_t num_kv_heads, int64_t total_kv_blocks);
 
+// InfLLMv2 paged K pooling (large GRF)
+at::Tensor esimd_infllmv2_k_pooling_paged(
+    at::Tensor kv_cache, at::Tensor key_pooled,
+    at::Tensor block_table, at::Tensor seq_lens,
+    int64_t num_kv_heads, int64_t head_dim,
+    int64_t page_size, int64_t num_pooled_blocks,
+    int64_t kernel_size, int64_t kernel_stride);
+
+// InfLLMv2 force last block insertion (large GRF)
+at::Tensor esimd_infllmv2_force_last_block(
+    at::Tensor sparse_mask, at::Tensor seq_lens,
+    int64_t num_kv_heads, int64_t sparse_block_size);
+
 // GDN (Gated Delta Network) state update (large GRF)
 at::Tensor esimd_gdn_update(
     at::Tensor A_log, at::Tensor dt_bias,

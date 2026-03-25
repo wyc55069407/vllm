@@ -564,6 +564,31 @@ def esimd_infllmv2_mask_convert(
         qlen, num_kv_heads, total_kv_blocks)
 
 
+def esimd_infllmv2_k_pooling_paged(
+    kv_cache: torch.Tensor, key_pooled: torch.Tensor,
+    block_table: torch.Tensor, seq_lens: torch.Tensor,
+    num_kv_heads: int, head_dim: int,
+    page_size: int, num_pooled_blocks: int,
+    kernel_size: int, kernel_stride: int,
+) -> torch.Tensor:
+    """InfLLMv2 paged K pooling: reads K directly from paged KV cache via block_table."""
+    return _ops.esimd_infllmv2_k_pooling_paged(
+        kv_cache, key_pooled, block_table, seq_lens,
+        num_kv_heads, head_dim,
+        page_size, num_pooled_blocks,
+        kernel_size, kernel_stride)
+
+
+def esimd_infllmv2_force_last_block(
+    sparse_mask: torch.Tensor, seq_lens: torch.Tensor,
+    num_kv_heads: int, sparse_block_size: int,
+) -> torch.Tensor:
+    """InfLLMv2 GPU-side last-block insertion into topk sparse mask."""
+    return _ops.esimd_infllmv2_force_last_block(
+        sparse_mask, seq_lens,
+        num_kv_heads, sparse_block_size)
+
+
 def esimd_gdn_update(
     A_log: torch.Tensor, dt_bias: torch.Tensor,
     a: torch.Tensor, b: torch.Tensor,

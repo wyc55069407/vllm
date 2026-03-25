@@ -101,6 +101,19 @@ TORCH_LIBRARY_FRAGMENT(vllm_kernel_custom, m) {
         "int qlen, int num_kv_heads, "
         "int total_kv_blocks) -> Tensor");
   m.impl("esimd_infllmv2_mask_convert", torch::kXPU, &esimd_infllmv2_mask_convert);
+
+  /* === InfLLMv2 Paged K Pooling === */
+  m.def("esimd_infllmv2_k_pooling_paged(Tensor kv_cache, Tensor key_pooled, "
+        "Tensor block_table, Tensor seq_lens, "
+        "int num_kv_heads, int head_dim, "
+        "int page_size, int num_pooled_blocks, "
+        "int kernel_size, int kernel_stride) -> Tensor");
+  m.impl("esimd_infllmv2_k_pooling_paged", torch::kXPU, &esimd_infllmv2_k_pooling_paged);
+
+  /* === InfLLMv2 Force Last Block === */
+  m.def("esimd_infllmv2_force_last_block(Tensor sparse_mask, Tensor seq_lens, "
+        "int num_kv_heads, int sparse_block_size) -> Tensor");
+  m.impl("esimd_infllmv2_force_last_block", torch::kXPU, &esimd_infllmv2_force_last_block);
 }
 
 REGISTER_EXTENSION(common_ops_lgrf)

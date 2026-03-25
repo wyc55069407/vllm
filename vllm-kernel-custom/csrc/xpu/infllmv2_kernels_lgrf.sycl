@@ -26,6 +26,7 @@ using namespace sycl::ext::intel::experimental;
 #include "esimd_kernels/sdp_paged_sparse_gqa.h"
 #include "esimd_kernels/infllmv2_pattern.h"
 #include "esimd_kernels/mask_convert.h"
+#include "esimd_kernels/infllmv2_utils.h"
 
 
 /* ============================================================
@@ -441,4 +442,102 @@ at::Tensor esimd_infllmv2_mask_convert(
     });
 
     return mask_cnt_out;
+}
+
+
+/* ============================================================
+ * InfLLMv2 Paged K Pooling
+ *
+ * Reads K directly from paged KV cache via block_table.
+ * Eliminates the Python page-copy loop.
+ *
+ * Input:  kv_cache [2, num_pages, page_size, nkvh, hd]
+ *         block_table [batch, max_blocks_per_seq] i32
+ *         seq_lens [batch] i32
+ * Output: key_pooled [batch, nkvh, num_pooled_blocks, hd] fp16
+ * ============================================================ */
+at::Tensor esimd_infllmv2_k_pooling_paged(
+    at::Tensor kv_cache,               // [2, num_pages, page_size, nkvh, hd]
+    at::Tensor key_pooled,             // [batch, nkvh, num_pooled_blocks, hd] fp16
+    at::Tensor block_table,            // [batch, max_blocks_per_seq] i32
+    at::Tensor seq_lens,               // [batch] i32
+    int64_t num_kv_heads, int64_t head_dim,
+    int64_t page_size,
+    int64_t num_pooled_blocks,
+    int64_t kernel_size, int64_t kernel_stride)
+{
+    auto stream = at::xpu::getCurrentXPUStream();
+    auto& dpcpp_queue = stream.queue();
+
+    int batch = (int)seq_lens.size(0);
+    int mbps = (int)block_table.size(1);
+    int ps = (int)page_size;
+    int npb = (int)num_pooled_blocks;
+
+    auto* kv_ptr = reinterpret_cast<const unsigned short*>(kv_cache.data_ptr());
+    auto* kp_ptr = reinterpret_cast<fp16*>(key_pooled.data_ptr());
+    auto* bt_ptr = block_table.data_ptr<int>();
+    auto* sl_ptr = seq_lens.data_ptr<int>();
+
+    int64_t kv_s1 = kv_cache.stride(1);  // per-page stride
+
+    bool is_bf16 = (kv_cache.scalar_type() == at::ScalarType::BFloat16);
+
+    TORCH_CHECK(num_kv_heads == 2 && head_dim == 128 &&
+                kernel_size == 32 && kernel_stride == 16,
+                "Only nkvh=2, hd=128, ks=32, kstride=16 supported");
+
+    auto dispatch = [&]<bool BF16>() {
+        dpcpp_queue.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(sycl::range<3>(batch, 2, npb),
+                [=](sycl::id<3> idx) SYCL_ESIMD_KERNEL {
+                infllmv2_k_pooling_paged<2, 128, 32, 16, BF16>(
+                    kv_ptr, bt_ptr, sl_ptr, kp_ptr,
+                    mbps, ps, npb,
+                    kv_s1, idx);
+            });
+        });
+    };
+
+    if (is_bf16) dispatch.template operator()<true>();
+    else         dispatch.template operator()<false>();
+
+    return key_pooled;
+}
+
+
+/* ============================================================
+ * InfLLMv2 Force Last Block
+ *
+ * GPU-side last-block insertion into topk sparse mask.
+ * Ensures (seq_len-1)/64 is present for each (batch, kv_head).
+ * Eliminates Python loop with .item() GPU syncs.
+ *
+ * sparse_mask: [batch, nkvh, topk] i32
+ * seq_lens:    [batch] i32
+ * ============================================================ */
+at::Tensor esimd_infllmv2_force_last_block(
+    at::Tensor sparse_mask,            // [batch, nkvh, topk] i32 — modified in place
+    at::Tensor seq_lens,               // [batch] i32
+    int64_t num_kv_heads,
+    int64_t sparse_block_size)
+{
+    auto stream = at::xpu::getCurrentXPUStream();
+    auto& dpcpp_queue = stream.queue();
+
+    int batch = (int)seq_lens.size(0);
+    int nkvh = (int)num_kv_heads;
+    int sb = (int)sparse_block_size;
+
+    auto* mask_ptr = sparse_mask.data_ptr<int32_t>();
+    auto* sl_ptr = seq_lens.data_ptr<int>();
+
+    dpcpp_queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(sycl::range<2>(batch, nkvh),
+            [=](sycl::id<2> idx) SYCL_ESIMD_KERNEL {
+            infllmv2_force_last_block<64>(mask_ptr, sl_ptr, nkvh, sb, idx);
+        });
+    });
+
+    return sparse_mask;
 }

@@ -202,6 +202,8 @@ class InfLLMv2EsimdAttentionImpl(AttentionImpl):
         self._esimd_sdp_paged = None
         self._esimd_sdp_paged_sparse = None
         self._esimd_k_pooling = None
+        self._esimd_k_pooling_paged = None
+        self._esimd_force_last_block = None
         self._esimd_pattern_prefill = None
         self._esimd_pattern_decode = None
         self._esimd_mask_convert = None
@@ -214,6 +216,8 @@ class InfLLMv2EsimdAttentionImpl(AttentionImpl):
                 esimd_sdp_paged,
                 esimd_sdp_paged_sparse,
                 esimd_infllmv2_k_pooling,
+                esimd_infllmv2_k_pooling_paged,
+                esimd_infllmv2_force_last_block,
                 esimd_infllmv2_pattern_prefill,
                 esimd_infllmv2_pattern_decode,
                 esimd_infllmv2_mask_convert,
@@ -221,6 +225,8 @@ class InfLLMv2EsimdAttentionImpl(AttentionImpl):
             self._esimd_sdp_paged = esimd_sdp_paged
             self._esimd_sdp_paged_sparse = esimd_sdp_paged_sparse
             self._esimd_k_pooling = esimd_infllmv2_k_pooling
+            self._esimd_k_pooling_paged = esimd_infllmv2_k_pooling_paged
+            self._esimd_force_last_block = esimd_infllmv2_force_last_block
             self._esimd_pattern_prefill = esimd_infllmv2_pattern_prefill
             self._esimd_pattern_decode = esimd_infllmv2_pattern_decode
             self._esimd_mask_convert = esimd_infllmv2_mask_convert
@@ -260,16 +266,17 @@ class InfLLMv2EsimdAttentionImpl(AttentionImpl):
         output: torch.Tensor,
         attn_metadata: InfLLMv2EsimdAttentionMetadata,
     ) -> torch.Tensor:
-        """Sparse decode: k_pool → pattern_detect → topk → sparse SDP."""
+        """Sparse decode: k_pool_paged → pattern_detect → topk → force_last_block → sparse SDP.
+
+        All operations on GPU — no CPU waits or .item() calls.
+        """
         batch = attn_metadata.seq_lens.shape[0]
         block_size = kv_cache.shape[2]
         device = query.device
         nkvh = self.num_kv_heads
         nh = self.num_heads
         hd = self.head_size
-
-        seq_lens_cpu = attn_metadata.seq_lens.cpu()
-        max_sl = int(seq_lens_cpu.max().item())
+        max_sl = attn_metadata.max_seq_len
 
         # Dimensions for pattern detection
         num_pooled_blocks = max(
@@ -279,35 +286,17 @@ class InfLLMv2EsimdAttentionImpl(AttentionImpl):
         num_pooled = max(
             1, (num_pooled_blocks + pooling_stride - 1) // pooling_stride)
 
-        # Step 1: Extract K from paged cache into contiguous buffer
-        # K cache: kv_cache[0] shape [num_blocks, block_size, nkvh, hd]
-        k_contiguous = torch.zeros(
-            batch, nkvh, max_sl, hd,
-            dtype=torch.float16, device=device)
-
-        bt_cpu = attn_metadata.block_table.cpu()
-        key_cache = kv_cache[0]
-        for b in range(batch):
-            sl = int(seq_lens_cpu[b].item())
-            num_pages = (sl + block_size - 1) // block_size
-            for p in range(num_pages):
-                phys_page = int(bt_cpu[b, p].item())
-                start = p * block_size
-                end = min(start + block_size, sl)
-                length = end - start
-                k_page = key_cache[phys_page, :length]
-                k_contiguous[b, :, start:end, :] = k_page.permute(
-                    1, 0, 2).half()
-
-        # Step 2: K pooling
+        # Step 1: Paged K pooling — reads directly from paged KV cache
         k_pooled = torch.zeros(
             batch, nkvh, num_pooled_blocks, hd,
             dtype=torch.float16, device=device)
 
-        self._esimd_k_pooling(
-            k_contiguous, k_pooled,
+        self._esimd_k_pooling_paged(
+            kv_cache, k_pooled,
+            attn_metadata.block_table,
+            attn_metadata.seq_lens,
             nkvh, hd,
-            max_sl, num_pooled_blocks,
+            block_size, num_pooled_blocks,
             self.kernel_size, self.kernel_stride)
 
         # NaN/inf check on intermediates
@@ -315,14 +304,11 @@ class InfLLMv2EsimdAttentionImpl(AttentionImpl):
             global _trace_call_count
             _trace_call_count += 1
             if _trace_call_count <= 5 or _trace_call_count % 200 == 0:
-                _check_tensor("decode_k_contiguous", k_contiguous,
-                              _trace_call_count)
                 _check_tensor("decode_k_pooled", k_pooled,
                               _trace_call_count)
                 _check_tensor("decode_query", query, _trace_call_count)
 
-        # Step 3: Pattern detection (decode)
-        # query shape: [num_tokens, nh, hd] where num_tokens = batch (1 per req)
+        # Step 2: Pattern detection (decode)
         q_for_pattern = query.view(batch, nh, hd).unsqueeze(2)  # [B, nh, 1, hd]
         if q_for_pattern.dtype != torch.float16:
             q_for_pattern = q_for_pattern.half()
@@ -347,9 +333,9 @@ class InfLLMv2EsimdAttentionImpl(AttentionImpl):
             block_scores, kv_block_scores,
             pooled_scores, topk_output,
             nh, nkvh,
-            1, num_pooled_blocks,  # seq_len=1, num_blocks
+            1, num_pooled_blocks,
             hd, num_pooled,
-            cache_len, 1,  # causal=True
+            cache_len, 1,
             self.init_blocks, self.local_blocks,
             self.topk)
 
@@ -362,39 +348,16 @@ class InfLLMv2EsimdAttentionImpl(AttentionImpl):
                               _trace_call_count)
                 _check_tensor("decode_pooled_scores", pooled_scores,
                               _trace_call_count)
-                # Log topk block selection
-                tk = topk_output.cpu()
-                for b in range(min(batch, 2)):
-                    for h in range(nkvh):
-                        blks = sorted(tk[b, h, 0].numpy().tolist())
-                        q_blk = (max_sl - 1) // self.sparse_block
-                        logger.info(
-                            "TRACE decode step=%d b=%d kvh=%d seq=%d "
-                            "q_blk=%d nblks=%d blocks=%s",
-                            _trace_call_count, b, h, max_sl, q_blk,
-                            len(blks), blks[:20])
 
-        # Step 4: SDP — sparse or dense depending on toggle
+        # Step 3: SDP — sparse or dense depending on toggle
         if INFLLMV2_USE_SPARSE_DECODE:
             # topk_output: [batch, nkvh, 1, 64] → [batch, nkvh, 64]
             sparse_mask = topk_output.squeeze(2).int()
 
-            # Force-insert last sparse block: it may have no pooled
-            # representation (num_pooled covers fewer tokens than seq_len)
-            # but the SDP must attend to the current token's block.
-            for b in range(batch):
-                sl = int(seq_lens_cpu[b].item())
-                last_blk = (sl - 1) // self.sparse_block
-                for h in range(nkvh):
-                    row = sparse_mask[b, h]
-                    if not (row == last_blk).any().item():
-                        # Replace the last slot (lowest-priority) with last_blk
-                        sparse_mask[b, h, -1] = last_blk
-                        if INFLLMV2_DEBUG_TRACE:
-                            logger.info(
-                                "DECODE: force-inserted last_blk=%d for "
-                                "b=%d h=%d sl=%d (was not in topk)",
-                                last_blk, b, h, sl)
+            # Force-insert last sparse block on GPU (no CPU sync)
+            self._esimd_force_last_block(
+                sparse_mask, attn_metadata.seq_lens,
+                nkvh, self.sparse_block)
 
             dummy_mask_cnt = torch.zeros(1, dtype=torch.int32, device=device)
 
@@ -428,52 +391,20 @@ class InfLLMv2EsimdAttentionImpl(AttentionImpl):
         output: torch.Tensor,
         attn_metadata: InfLLMv2EsimdAttentionMetadata,
     ) -> torch.Tensor:
-        """Sparse prefill: k_pooling → pattern_detect → mask_convert → sparse SDP."""
+        """Sparse prefill: k_pooling_paged → pattern_detect → mask_convert → sparse SDP.
+
+        All operations on GPU — no CPU waits or .item() calls.
+        """
         batch = attn_metadata.seq_lens.shape[0]
         block_size = kv_cache.shape[2]
         device = query.device
-        dtype = query.dtype
         q_len = query.shape[0]
+        max_sl = attn_metadata.max_seq_len
 
-        seq_lens_cpu = attn_metadata.seq_lens.cpu()
-        max_sl = int(seq_lens_cpu.max().item())
-
-        # Step 1: Extract K from paged cache for pooling
-        # K cache: kv_cache[0, :, :, :, :]
-        # For pooling, we need contiguous [bsz, nkvh, kv_len, hd] layout
-        # Extract from paged format using block_table
-        # TODO: Direct paged K pooling kernel would be more efficient
-
-        # For now, gather K into contiguous buffer
         nkvh = self.num_kv_heads
         hd = self.head_size
 
-        # Contiguous K buffer for pooling
-        k_contiguous = torch.zeros(
-            batch, nkvh, max_sl, hd,
-            dtype=torch.float16, device=device)
-
-        bt_cpu = attn_metadata.block_table.cpu()
-        key_cache = kv_cache[0]  # [num_blocks, block_size, nkvh, hd]
-
-        for b in range(batch):
-            sl = int(seq_lens_cpu[b].item())
-            num_pages = (sl + block_size - 1) // block_size
-            for p in range(num_pages):
-                phys_page = int(bt_cpu[b, p].item())
-                start = p * block_size
-                end = min(start + block_size, sl)
-                length = end - start
-                # key_cache[phys_page, :length, :, :] -> k_contiguous[b, :, start:end, :]
-                # key_cache shape: [num_blocks, block_size, nkvh, hd]
-                k_page = key_cache[phys_page, :length]  # [length, nkvh, hd]
-                k_contiguous[b, :, start:end, :] = k_page.permute(1, 0, 2)
-
-        # Convert to fp16 if needed (pooling kernels expect fp16)
-        if k_contiguous.dtype != torch.float16:
-            k_contiguous = k_contiguous.half()
-
-        # Step 2: K pooling
+        # Step 1: Paged K pooling — reads directly from paged KV cache
         num_pooled_blocks = (max_sl - self.kernel_size + self.kernel_stride) // self.kernel_stride
         if num_pooled_blocks <= 0:
             num_pooled_blocks = 1
@@ -482,15 +413,16 @@ class InfLLMv2EsimdAttentionImpl(AttentionImpl):
             batch, nkvh, num_pooled_blocks, hd,
             dtype=torch.float16, device=device)
 
-        self._esimd_k_pooling(
-            k_contiguous, k_pooled,
+        self._esimd_k_pooling_paged(
+            kv_cache, k_pooled,
+            attn_metadata.block_table,
+            attn_metadata.seq_lens,
             nkvh, hd,
-            max_sl, num_pooled_blocks,
+            block_size, num_pooled_blocks,
             self.kernel_size, self.kernel_stride)
 
         # NaN/inf check on prefill intermediates
         if INFLLMV2_DEBUG_TRACE:
-            _check_tensor("prefill_k_contiguous", k_contiguous, 0)
             _check_tensor("prefill_k_pooled", k_pooled, 0)
             _check_tensor("prefill_query", query, 0)
 
