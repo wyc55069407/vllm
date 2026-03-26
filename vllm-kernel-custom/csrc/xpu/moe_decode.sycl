@@ -1,6 +1,11 @@
-/* MoE decode fused ESIMD kernels — SYCL dispatch
+/* MoE decode fused ESIMD kernels — SYCL dispatch (optimized v3)
  * Pipeline: fused up_gate_silu → down → gather
  * Supports: bf16/fp16 IO, GPTQ INT4 symmetric, variable group_size (32/64/128)
+ *
+ * v3: dequant_dot fusion + ROWS=4 batching.
+ *   - dequant_dot: fused dequant + dot product without full VL weight vector
+ *   - ROWS=4: each thread processes 4 output rows, sharing input load
+ * Reduces thread count ~4x and L2 input traffic ~4x.
  */
 
 #include <ATen/ATen.h>
@@ -13,22 +18,26 @@
 using fp16 = sycl::half;
 using bf16 = sycl::ext::oneapi::bfloat16;
 
+constexpr int ROWS_UP = 4;
+constexpr int ROWS_DN = 8;
+
 
 /* ─── Up+Gate+SiLU dispatch ─────────────────────────────────────────────────*/
-template<typename IT, int GS>
+template<typename IT, int GS, int VL>
 static void launch_up_gate_silu(
     const IT* x, const uint8_t* w13, const IT* w13_scales,
     const int* topk_ids, IT* intermediates,
     int M, int N, int K, int topk, int num_experts,
     sycl::queue& q) {
 
+    int N_groups = (N + ROWS_UP - 1) / ROWS_UP;
     auto range = sycl::nd_range<3>(
-        sycl::range<3>(M, topk, N),
+        sycl::range<3>(M, topk, N_groups),
         sycl::range<3>(1, 1, 1));
 
     q.submit([&](sycl::handler& cgh) {
         cgh.parallel_for(range, [=](sycl::nd_item<3> item) SYCL_ESIMD_KERNEL {
-            moe_up_gate_silu_kernel<IT, GS>(
+            moe_up_gate_silu_rows<IT, GS, VL, ROWS_UP>(
                 x, w13, w13_scales, topk_ids, intermediates,
                 M, N, K, topk, num_experts, item);
         });
@@ -37,20 +46,21 @@ static void launch_up_gate_silu(
 
 
 /* ─── Down projection dispatch ──────────────────────────────────────────────*/
-template<typename IT, int GS>
+template<typename IT, int GS, int VL_D>
 static void launch_down(
     const IT* intermediates, const uint8_t* w2, const IT* w2_scales,
     const int* topk_ids, IT* down_out,
     int M, int N, int K, int topk, int num_experts,
     sycl::queue& q) {
 
+    int K_groups = (K + ROWS_DN - 1) / ROWS_DN;
     auto range = sycl::nd_range<3>(
-        sycl::range<3>(M, topk, K),
+        sycl::range<3>(M, topk, K_groups),
         sycl::range<3>(1, 1, 1));
 
     q.submit([&](sycl::handler& cgh) {
         cgh.parallel_for(range, [=](sycl::nd_item<3> item) SYCL_ESIMD_KERNEL {
-            moe_down_kernel<IT, GS>(
+            moe_down_rows<IT, GS, VL_D, ROWS_DN>(
                 intermediates, w2, w2_scales, topk_ids, down_out,
                 M, N, K, topk, num_experts, item);
         });
@@ -79,21 +89,7 @@ static void launch_gather(
 }
 
 
-/* ─── Fused MoE decode: up_gate_silu + down + gather ────────────────────────
- *
- * Args:
- *   x:            [M, K]           bf16/fp16  — hidden states
- *   w13_qweight:  [E, 2*N, K/2]   uint8      — gate+up packed INT4
- *   w13_scales:   [E, 2*N, K/GS]  bf16/fp16  — gate+up scales
- *   w2_qweight:   [E, K, N/2]     uint8      — down packed INT4
- *   w2_scales:    [E, K, N/GS]    bf16/fp16  — down scales
- *   topk_weights: [M, topk]       float32    — routing weights
- *   topk_ids:     [M, topk]       int32      — selected expert IDs
- *   output:       [M, K]          bf16/fp16  — pre-allocated output
- *   group_size:   int             — quantization group size (32, 64, 128)
- *
- * Returns: output tensor
- */
+/* ─── Fused MoE decode: up_gate_silu + down + gather ────────────────────────*/
 at::Tensor esimd_moe_decode(
     at::Tensor x,
     at::Tensor w13_qweight,
@@ -116,7 +112,7 @@ at::Tensor esimd_moe_decode(
     const int M = x.size(0);
     const int K = x.size(1);
     const int num_experts = w13_qweight.size(0);
-    const int N = w13_qweight.size(1) / 2;  // intermediate_size
+    const int N = w13_qweight.size(1) / 2;
     const int topk = topk_ids.size(1);
 
     TORCH_CHECK(M >= 1 && M <= 8, "M must be 1..8 for decode");
@@ -127,7 +123,6 @@ at::Tensor esimd_moe_decode(
     TORCH_CHECK(K % group_size == 0, "K must be divisible by group_size");
     TORCH_CHECK(N % group_size == 0, "N must be divisible by group_size");
 
-    // Verify shapes
     TORCH_CHECK(w13_qweight.size(2) == K / 2);
     TORCH_CHECK(w13_scales.size(0) == num_experts);
     TORCH_CHECK(w13_scales.size(1) == 2 * N);
@@ -144,28 +139,36 @@ at::Tensor esimd_moe_decode(
 
     sycl::queue& queue = c10::xpu::getCurrentXPUStream(x.device().index()).queue();
 
-    // Allocate intermediates [M, topk, N] and down_out [M, topk, K]
     auto intermediates = at::empty({M * topk, N},
         at::TensorOptions().device(x.device()).dtype(x.scalar_type()));
     auto down_out = at::empty({M * topk, K},
         at::TensorOptions().device(x.device()).dtype(x.scalar_type()));
 
-    // Dispatch based on dtype and group_size
-    #define DISPATCH_GS(IT, gs) do { \
-        launch_up_gate_silu<IT, gs>( \
+    #define LAUNCH_UP(IT, gs, vl) \
+        launch_up_gate_silu<IT, gs, vl>( \
             (const IT*)x.data_ptr(), \
             (const uint8_t*)w13_qweight.data_ptr(), \
             (const IT*)w13_scales.data_ptr(), \
             topk_ids.data_ptr<int>(), \
             (IT*)intermediates.data_ptr(), \
-            M, N, K, topk, num_experts, queue); \
-        launch_down<IT, gs>( \
+            M, N, K, topk, num_experts, queue)
+
+    #define LAUNCH_DN(IT, gs, vl) \
+        launch_down<IT, gs, vl>( \
             (const IT*)intermediates.data_ptr(), \
             (const uint8_t*)w2_qweight.data_ptr(), \
             (const IT*)w2_scales.data_ptr(), \
             topk_ids.data_ptr<int>(), \
             (IT*)down_out.data_ptr(), \
-            M, N, K, topk, num_experts, queue); \
+            M, N, K, topk, num_experts, queue)
+
+    #define DISPATCH_GS(IT, gs) do { \
+        if (K >= 4 * gs) { LAUNCH_UP(IT, gs, 4 * gs); } \
+        else if (K >= 2 * gs) { LAUNCH_UP(IT, gs, 2 * gs); } \
+        else { LAUNCH_UP(IT, gs, gs); } \
+        if (N >= 4 * gs) { LAUNCH_DN(IT, gs, 4 * gs); } \
+        else if (N >= 2 * gs) { LAUNCH_DN(IT, gs, 2 * gs); } \
+        else { LAUNCH_DN(IT, gs, gs); } \
         launch_gather<IT>( \
             (const IT*)down_out.data_ptr(), \
             topk_weights.data_ptr<float>(), \

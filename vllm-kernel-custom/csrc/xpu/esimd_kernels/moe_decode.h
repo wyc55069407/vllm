@@ -1,10 +1,14 @@
 /* MoE decode fused ESIMD kernel for W4A16 GPTQ (INT4 symmetric)
  *
- * Pipeline: topk → fused up_gate_silu_mul → down → gather
+ * Optimized v3: dequant_dot fusion + multi-row (ROWS) batching
+ *   - dequant_dot: fuses dequant + dot product WITHOUT materializing full VL
+ *     weight vector. Processes GS-sized blocks, uses strided select on input.
+ *     Saves ~2KB register pressure vs separate dequant+dot.
+ *   - ROWS: each thread computes ROWS output rows, sharing a single input
+ *     vector load. Reduces L2 traffic by ROWS x, reduces thread count.
+ *   - SIMD select for lo/hi nibble interleaving (proven 2x on W4A16 GEMV)
  *
- * Designed for decode (M=1..8 tokens). Each token selects topk experts.
- * Simple per-element parallelism: 1 thread = 1 output element of 1 expert.
- * Memory-bound — assumes different tokens pick different experts (no reuse).
+ * Pipeline: topk -> fused up_gate_silu_mul -> down -> gather
  *
  * vLLM GPTQ INT4 layout (symmetric, no zero points):
  *   w13_qweight: [E, 2*N, K/2]  uint8  (2 u4 values per byte)
@@ -16,6 +20,11 @@
  *
  * IT = input/output type (bf16 or fp16)
  * GS = group size for quantization (32, 64, 128)
+ * VL = vector length per iteration (must be multiple of GS)
+ * ROWS = output rows per thread (input reuse factor)
+ *
+ * BMG target: 20 XE cores, 160 EUs, 1280 HW threads
+ * Peak BW = 450 GB/s. Target >80% = 360+ GB/s.
  */
 
 #pragma once
@@ -25,142 +34,196 @@
 using namespace sycl::ext::intel::esimd;
 using namespace sycl::ext::intel::experimental::esimd;
 
-/* ─── Up+Gate+SiLU fused kernel ──────────────────────────────────────────────
- * For each (token, expert_slot, row) compute:
- *   gate = dot(x, w13_gate[eid, row, :])
- *   up   = dot(x, w13_up[eid, row, :])
- *   out  = silu(gate) * up
+
+/* ─── Helper: Fused dequant + dot product ──────────────────────────────────
+ * Loads VL/2 packed bytes, unpacks nibbles per GS block, and computes dot
+ * product with input_f using strided select — never materializes a full
+ * VL-sized weight vector.
  *
- * Parallelism: range<3>(M, topk, N)  — 1 thread = 1 output element
- * w13_qweight layout: [E, 2*N, K/2] — gate at rows [0..N), up at rows [N..2N)
- * w13_scales layout:  [E, 2*N, K/GS]
+ * Register pressure: ~3KB peak (input_f passed by ref, lo/hi are GS/2-sized)
+ * vs ~6KB for separate dequant_block + reduce(input * weight).
  */
-template<typename IT, int GS>
-void moe_up_gate_silu_kernel(
+template<typename IT, int GS, int VL>
+SYCL_ESIMD_FUNCTION inline float dequant_dot(
+    const uint8_t* packed_ptr,
+    const IT* scale_ptr,
+    simd<float, VL>& input_f) {
+
+    constexpr int NUM_BLOCKS = VL / GS;
+
+    simd<uint8_t, VL / 2> packed = block_load<uint8_t, VL / 2>(packed_ptr);
+    simd<float, NUM_BLOCKS> scales = convert<float>(
+        block_load<IT, NUM_BLOCKS>(scale_ptr));
+
+    float acc = 0.f;
+
+    #pragma unroll
+    for (int blk = 0; blk < NUM_BLOCKS; blk++) {
+        float sc = scales[blk];
+        int poff = blk * (GS / 2);
+
+        auto p = packed.template select<GS / 2, 1>(poff);
+        simd<float, GS / 2> lo = p & 0x0F;
+        simd<float, GS / 2> hi = (p >> 4) & 0x0F;
+        lo = (lo - 8.0f) * sc;
+        hi = (hi - 8.0f) * sc;
+
+        int base = blk * GS;
+        auto in_lo = input_f.template select<GS / 2, 2>(base + 0);
+        auto in_hi = input_f.template select<GS / 2, 2>(base + 1);
+        acc += reduce<float>(in_lo * lo + in_hi * hi, std::plus<>());
+    }
+    return acc;
+}
+
+
+/* ─── Up+Gate+SiLU fused kernel (multi-row) ───────────────────────────────
+ *
+ * 1 thread = ROWS output elements (gate + up for ROWS rows of one expert)
+ * Parallelism: range<3>(M, topk, N/ROWS)
+ *
+ * Each thread loads input x[K] once per VL iteration and reuses it for all
+ * ROWS rows' gate and up dequant_dot calls. This gives ROWS x L2 traffic
+ * reduction for the input vector.
+ */
+template<typename IT, int GS, int VL, int ROWS>
+void moe_up_gate_silu_rows(
     const IT* __restrict__ x,          // [M, K]
     const uint8_t* __restrict__ w13,   // [E, 2*N, K/2]
     const IT* __restrict__ w13_scales, // [E, 2*N, K/GS]
     const int* __restrict__ topk_ids,  // [M, topk]
-    IT* __restrict__ intermediates,    // [M, topk, N]
+    IT* __restrict__ intermediates,    // [M*topk, N]
     const int M, const int N, const int K,
     const int topk, const int num_experts,
     sycl::nd_item<3> item) {
 
     const int token = item.get_global_id(0);
     const int slot  = item.get_global_id(1);
-    const int row   = item.get_global_id(2);
+    const int rg    = item.get_global_id(2);
 
-    if (token >= M || slot >= topk || row >= N) return;
+    if (token >= M || slot >= topk) return;
+    const int base_row = rg * ROWS;
+    if (base_row >= N) return;
 
     const int eid = topk_ids[token * topk + slot];
+    const int out_off = (token * topk + slot) * N + base_row;
+
     if (eid < 0 || eid >= num_experts) {
-        intermediates[(token * topk + slot) * N + row] = IT(0);
+        #pragma unroll
+        for (int r = 0; r < ROWS; r++)
+            if (base_row + r < N)
+                intermediates[out_off + r] = IT(0);
         return;
     }
 
     const int half_K = K / 2;
-    const int num_groups = K / GS;
+    const int nsg = K / GS;
     const int two_N = 2 * N;
-
-    // Pointers to gate row and up row for this expert
-    const uint8_t* gate_w = w13 + (size_t)eid * two_N * half_K + (size_t)row * half_K;
-    const uint8_t* up_w   = w13 + (size_t)eid * two_N * half_K + (size_t)(N + row) * half_K;
-    const IT* gate_s = w13_scales + (size_t)eid * two_N * num_groups + (size_t)row * num_groups;
-    const IT* up_s   = w13_scales + (size_t)eid * two_N * num_groups + (size_t)(N + row) * num_groups;
-
     const IT* xptr = x + (size_t)token * K;
 
-    simd<float, GS> gate_acc(0.f), up_acc(0.f);
+    const size_t expert_w_base = (size_t)eid * two_N * half_K;
+    const size_t expert_s_base = (size_t)eid * two_N * nsg;
 
-    for (int k = 0; k < K; k += GS) {
-        // Load input
-        simd<float, GS> xv = convert<float>(block_load<IT, GS>(xptr + k));
+    float gate_sums[ROWS] = {};
+    float up_sums[ROWS] = {};
 
-        // Load and convert scales (bf16/fp16 → float)
-        float gate_scale = (float)gate_s[k / GS];
-        float up_scale   = (float)up_s[k / GS];
+    for (int k = 0; k < K; k += VL) {
+        simd<float, VL> input_f = convert<float>(block_load<IT, VL>(xptr + k));
 
-        // Gate: load GS/2 packed bytes → GS u4 values, dequantize
-        simd<uint8_t, GS / 2> gp = block_load<uint8_t, GS / 2>(gate_w + k / 2);
-        simd<uint8_t, GS> gu;
-        gu.template select<GS / 2, 2>(0) = gp & 0x0F;
-        gu.template select<GS / 2, 2>(1) = (gp >> 4) & 0x0F;
-        simd<float, GS> gw_dq = (convert<float>(gu) - 8.0f) * gate_scale;
-        gate_acc += xv * gw_dq;
+        #pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            int row = base_row + r;
+            if (row >= N) break;
 
-        // Up: same pattern
-        simd<uint8_t, GS / 2> up = block_load<uint8_t, GS / 2>(up_w + k / 2);
-        simd<uint8_t, GS> uu;
-        uu.template select<GS / 2, 2>(0) = up & 0x0F;
-        uu.template select<GS / 2, 2>(1) = (up >> 4) & 0x0F;
-        simd<float, GS> uw_dq = (convert<float>(uu) - 8.0f) * up_scale;
-        up_acc += xv * uw_dq;
+            gate_sums[r] += dequant_dot<IT, GS, VL>(
+                w13 + expert_w_base + (size_t)row * half_K + k / 2,
+                w13_scales + expert_s_base + (size_t)row * nsg + k / GS,
+                input_f);
+            up_sums[r] += dequant_dot<IT, GS, VL>(
+                w13 + expert_w_base + (size_t)(N + row) * half_K + k / 2,
+                w13_scales + expert_s_base + (size_t)(N + row) * nsg + k / GS,
+                input_f);
+        }
     }
 
-    float g = sycl::ext::intel::esimd::detail::sum<float, float, GS>(gate_acc);
-    float u = sycl::ext::intel::esimd::detail::sum<float, float, GS>(up_acc);
-
-    // SiLU(gate) * up
-    float silu_g = g / (1.f + sycl::exp(-g));
-    intermediates[(token * topk + slot) * N + row] = IT(silu_g * u);
+    #pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        if (base_row + r >= N) break;
+        float g = gate_sums[r];
+        float u = up_sums[r];
+        float silu_g = g / (1.f + sycl::exp(-g));
+        intermediates[out_off + r] = IT(silu_g * u);
+    }
 }
 
 
-/* ─── Down projection kernel ─────────────────────────────────────────────────
- * For each (token, expert_slot, row) compute:
- *   result = dot(intermediates[token, slot, :], w2[eid, row, :])
+/* ─── Down projection kernel (multi-row) ──────────────────────────────────
  *
- * Parallelism: range<3>(M, topk, K)  — 1 thread = 1 output row
- * w2_qweight layout: [E, K, N/2]
- * w2_scales layout:  [E, K, N/GS]
+ * 1 thread = ROWS output rows (K dim) of down projection.
+ * Parallelism: range<3>(M, topk, K/ROWS)
+ *
+ * Each thread loads intermediate[N] once per VL iteration and reuses it
+ * for all ROWS weight rows' dequant_dot calls.
  */
-template<typename IT, int GS>
-void moe_down_kernel(
-    const IT* __restrict__ intermediates, // [M, topk, N]
+template<typename IT, int GS, int VL_D, int ROWS>
+void moe_down_rows(
+    const IT* __restrict__ intermediates, // [M*topk, N]
     const uint8_t* __restrict__ w2,       // [E, K, N/2]
     const IT* __restrict__ w2_scales,     // [E, K, N/GS]
     const int* __restrict__ topk_ids,     // [M, topk]
-    IT* __restrict__ down_out,            // [M, topk, K]
+    IT* __restrict__ down_out,            // [M*topk, K]
     const int M, const int N, const int K,
     const int topk, const int num_experts,
     sycl::nd_item<3> item) {
 
     const int token = item.get_global_id(0);
     const int slot  = item.get_global_id(1);
-    const int row   = item.get_global_id(2);
+    const int rg    = item.get_global_id(2);
 
-    if (token >= M || slot >= topk || row >= K) return;
+    if (token >= M || slot >= topk) return;
+    const int base_row = rg * ROWS;
+    if (base_row >= K) return;
 
     const int eid = topk_ids[token * topk + slot];
+    const int out_off = (token * topk + slot) * K + base_row;
+
     if (eid < 0 || eid >= num_experts) {
-        down_out[(token * topk + slot) * K + row] = IT(0);
+        #pragma unroll
+        for (int r = 0; r < ROWS; r++)
+            if (base_row + r < K)
+                down_out[out_off + r] = IT(0);
         return;
     }
 
     const int half_N = N / 2;
-    const int num_groups = N / GS;
-
-    const uint8_t* dw = w2 + (size_t)eid * K * half_N + (size_t)row * half_N;
-    const IT* ds = w2_scales + (size_t)eid * K * num_groups + (size_t)row * num_groups;
+    const int nsg = N / GS;
     const IT* hi = intermediates + (size_t)(token * topk + slot) * N;
 
-    simd<float, GS> acc(0.f);
+    const size_t expert_w_base = (size_t)eid * K * half_N;
+    const size_t expert_s_base = (size_t)eid * K * nsg;
 
-    for (int n = 0; n < N; n += GS) {
-        simd<float, GS> hv = convert<float>(block_load<IT, GS>(hi + n));
+    float row_sums[ROWS] = {};
 
-        float scale = (float)ds[n / GS];
+    for (int n = 0; n < N; n += VL_D) {
+        simd<float, VL_D> hi_f = convert<float>(block_load<IT, VL_D>(hi + n));
 
-        simd<uint8_t, GS / 2> dp = block_load<uint8_t, GS / 2>(dw + n / 2);
-        simd<uint8_t, GS> du;
-        du.template select<GS / 2, 2>(0) = dp & 0x0F;
-        du.template select<GS / 2, 2>(1) = (dp >> 4) & 0x0F;
-        simd<float, GS> dw_dq = (convert<float>(du) - 8.0f) * scale;
-        acc += hv * dw_dq;
+        #pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            int row = base_row + r;
+            if (row >= K) break;
+
+            row_sums[r] += dequant_dot<IT, GS, VL_D>(
+                w2 + expert_w_base + (size_t)row * half_N + n / 2,
+                w2_scales + expert_s_base + (size_t)row * nsg + n / GS,
+                hi_f);
+        }
     }
 
-    float result = sycl::ext::intel::esimd::detail::sum<float, float, GS>(acc);
-    down_out[(token * topk + slot) * K + row] = IT(result);
+    #pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        if (base_row + r >= K) break;
+        down_out[out_off + r] = IT(row_sums[r]);
+    }
 }
 
 
@@ -168,7 +231,7 @@ void moe_down_kernel(
  * For each (token, dim) accumulate:
  *   output[token, dim] = sum_over_slot(topk_weights[token, slot] * down_out[token, slot, dim])
  *
- * Parallelism: range<2>(M, K)  — 1 thread = 1 output element
+ * Parallelism: range<2>(M, K) — 1 thread = 1 output element
  */
 template<typename IT>
 void moe_gather_kernel(
