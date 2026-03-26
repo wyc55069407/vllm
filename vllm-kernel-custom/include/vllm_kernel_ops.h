@@ -195,6 +195,15 @@ at::Tensor esimd_dsa_mega(
     int64_t real_total_count_reserved, int64_t groups,
     double knorm_eps, double softmax_scale);
 
+/* ========== MoE decode ESIMD ops (common_ops) ========== */
+
+// Fused MoE decode: up_gate_silu + down + gather (W4A16 GPTQ INT4 symmetric)
+at::Tensor esimd_moe_decode(
+    at::Tensor x, at::Tensor w13_qweight, at::Tensor w13_scales,
+    at::Tensor w2_qweight, at::Tensor w2_scales,
+    at::Tensor topk_weights, at::Tensor topk_ids,
+    at::Tensor output, int64_t group_size);
+
 /* ========== oneDNN ops (common_ops) ========== */
 
 // oneDNN FP8 GEMM: FP16/BF16 x FP8_E4M3, per-N scale

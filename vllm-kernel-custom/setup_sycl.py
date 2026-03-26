@@ -41,6 +41,7 @@ sources = [
     "csrc/xpu/awq_dequantize.sycl",
     "csrc/xpu/uni_esimd_kernel.sycl",
     "csrc/xpu/onednn_fp8.sycl",
+    "csrc/xpu/moe_decode.sycl",
     "csrc/xpu/torch_extension_sycl.cc",
 ]
 

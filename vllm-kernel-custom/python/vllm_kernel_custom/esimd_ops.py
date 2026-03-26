@@ -317,6 +317,36 @@ def esimd_dsa_mega(
 
 
 # ============================================================
+# MoE decode ESIMD ops (common_ops)
+# ============================================================
+
+def esimd_moe_decode(
+    x: torch.Tensor, w13_qweight: torch.Tensor, w13_scales: torch.Tensor,
+    w2_qweight: torch.Tensor, w2_scales: torch.Tensor,
+    topk_weights: torch.Tensor, topk_ids: torch.Tensor,
+    output: torch.Tensor, group_size: int,
+) -> torch.Tensor:
+    """Fused MoE decode: up_gate_silu + down + gather (W4A16 GPTQ INT4 symmetric).
+
+    Args:
+        x:            [M, K]           bf16/fp16  — hidden states (M=1..8 tokens)
+        w13_qweight:  [E, 2*N, K/2]   uint8      — gate+up packed INT4
+        w13_scales:   [E, 2*N, K/GS]  bf16/fp16  — gate+up scales
+        w2_qweight:   [E, K, N/2]     uint8      — down packed INT4
+        w2_scales:    [E, K, N/GS]    bf16/fp16  — down scales
+        topk_weights: [M, topk]       float32    — routing weights (sigmoid)
+        topk_ids:     [M, topk]       int32      — selected expert IDs
+        output:       [M, K]          bf16/fp16  — pre-allocated output
+        group_size:   32, 64, or 128  — quantization group size
+    """
+    return _ops.esimd_moe_decode(
+        x, w13_qweight, w13_scales,
+        w2_qweight, w2_scales,
+        topk_weights, topk_ids,
+        output, group_size)
+
+
+# ============================================================
 # oneDNN ops (common_ops)
 # ============================================================
 
