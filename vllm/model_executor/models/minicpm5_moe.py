@@ -9,6 +9,8 @@ Architecture: GQA with gated attention + DeepSeek V3-style MoE.
 - Sigmoid scoring with e_score_correction_bias
 """
 
+import os
+import time
 import typing
 from collections.abc import Callable, Iterable
 
@@ -314,6 +316,8 @@ class MiniCPM5MoEMoE(nn.Module):
             else torch.bfloat16
         )
 
+    _moe_inspected = False
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -321,17 +325,84 @@ class MiniCPM5MoEMoE(nn.Module):
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
 
+        # === MOE INSPECT: dump shapes on first decode call ===
+        do_inspect = (
+            os.environ.get("MINICPM5_MOE_INSPECT") == "1"
+            and not MiniCPM5MoEMoE._moe_inspected
+            and num_tokens == 1  # decode step
+        )
+
+        if do_inspect:
+            MiniCPM5MoEMoE._moe_inspected = True
+            import sys
+            P = lambda *a: print(*a, file=sys.stderr, flush=True)
+            P("\n" + "=" * 80)
+            P("  MOE INSPECT (layer 1, first decode step)")
+            P("=" * 80)
+            P(f"\n  INPUT hidden_states: {hidden_states.shape} {hidden_states.dtype}")
+            P(f"    values[:8]: {hidden_states[0,:8].tolist()}")
+
+            # Gate weights
+            P(f"\n  GATE weight: {self.gate.weight.shape} {self.gate.weight.dtype}")
+            if hasattr(self.gate, 'e_score_correction_bias'):
+                P(f"  e_score_correction_bias: "
+                  f"{self.gate.e_score_correction_bias.shape} "
+                  f"{self.gate.e_score_correction_bias.dtype}")
+
         if self.experts.is_internal_router:
             fused_moe_out = self.experts(
                 hidden_states=hidden_states, router_logits=hidden_states
             )
         else:
             router_logits, _ = self.gate(hidden_states)
+
+            if do_inspect:
+                P(f"\n  ROUTER LOGITS: {router_logits.shape} {router_logits.dtype}")
+                P(f"    min={router_logits.min().item():.4f} "
+                  f"max={router_logits.max().item():.4f}")
+                topk_vals, topk_idx = torch.topk(router_logits[0], 16)
+                P(f"    top-16 indices: {topk_idx.tolist()}")
+                P(f"    top-16 values:  {[f'{v:.4f}' for v in topk_vals.tolist()]}")
+
             fused_moe_out = self.experts(
                 hidden_states=hidden_states, router_logits=router_logits
             )
 
         shared_output, final_hidden_states = fused_moe_out
+
+        if do_inspect:
+            P(f"\n  ROUTED OUTPUT (before scaling): {final_hidden_states.shape} "
+              f"{final_hidden_states.dtype}")
+            P(f"    values[:8]: {final_hidden_states[0,:8].tolist()}")
+            P(f"  routed_scaling_factor: {self.routed_scaling_factor}")
+            if shared_output is not None:
+                P(f"  SHARED OUTPUT: {shared_output.shape} {shared_output.dtype}")
+                P(f"    values[:8]: {shared_output[0,:8].tolist()}")
+
+            # Dump expert weights
+            experts_layer = self.experts
+            P(f"\n  --- EXPERT WEIGHTS ---")
+            for attr in ['w13_qweight', 'w2_qweight', 'w13_scales', 'w2_scales',
+                         'w13_qzeros', 'w2_qzeros']:
+                w = getattr(experts_layer, attr, None)
+                if w is None:
+                    # Check if nested in quant_method
+                    pass
+                else:
+                    P(f"  {attr}: {w.shape} {w.dtype}")
+
+            # Check nested in experts module
+            for name, param in experts_layer.named_parameters():
+                if any(k in name for k in ['qweight', 'scales', 'qzeros',
+                                            'weight', 'w1', 'w2', 'w13']):
+                    P(f"  experts.{name}: {param.shape} {param.dtype}")
+
+            # Shared expert weights
+            if self.shared_experts is not None:
+                P(f"\n  --- SHARED EXPERT WEIGHTS ---")
+                for name, param in self.shared_experts.named_parameters():
+                    P(f"  shared.{name}: {param.shape} {param.dtype}")
+
         if self.shared_experts is None:
             assert shared_output is None
 
@@ -345,6 +416,12 @@ class MiniCPM5MoEMoE(nn.Module):
         if self.shared_experts is not None:
             assert shared_output is not None
             final_hidden_states += shared_output
+
+        if do_inspect:
+            P(f"\n  FINAL OUTPUT (after scaling + shared): "
+              f"{final_hidden_states.shape} {final_hidden_states.dtype}")
+            P(f"    values[:8]: {final_hidden_states[0,:8].tolist()}")
+            P("=" * 80 + "\n")
 
         if self.is_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
@@ -406,24 +483,69 @@ class MiniCPM5MoEDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+    _profile_enabled = None  # class-level cache
+
+    @classmethod
+    def _is_profile_enabled(cls):
+        if cls._profile_enabled is None:
+            cls._profile_enabled = os.environ.get("MINICPM5_PROFILE", "0") == "1"
+            if cls._profile_enabled:
+                cls._profile_step = 0
+                cls._profile_data = []  # list of (step, layer, attn_ms, mlp_ms, total_ms, n_tokens)
+        return cls._profile_enabled
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        do_profile = self._is_profile_enabled()
+
+        if do_profile:
+            n_tokens = hidden_states.shape[0]
+            torch.xpu.synchronize()
+            t_start = time.perf_counter()
+
         if residual is None:
             residual = hidden_states.clone()
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
+        if do_profile:
+            torch.xpu.synchronize()
+            t_attn_start = time.perf_counter()
+
         hidden_states = self.self_attn(positions, hidden_states)
+
+        if do_profile:
+            torch.xpu.synchronize()
+            t_attn_end = time.perf_counter()
 
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual
         )
+
+        if do_profile:
+            torch.xpu.synchronize()
+            t_mlp_start = time.perf_counter()
+
         hidden_states = self.mlp(hidden_states)
+
+        if do_profile:
+            torch.xpu.synchronize()
+            t_end = time.perf_counter()
+            step = self.__class__._profile_step
+            attn_ms = (t_attn_end - t_attn_start) * 1000
+            mlp_ms = (t_end - t_mlp_start) * 1000
+            total_ms = (t_end - t_start) * 1000
+            self.__class__._profile_data.append(
+                (step, self.layer_idx, attn_ms, mlp_ms, total_ms, n_tokens)
+            )
+            # Increment step counter after last layer
+            if self.layer_idx == 27:
+                self.__class__._profile_step += 1
 
         return hidden_states, residual
 
@@ -542,7 +664,103 @@ class MiniCPM5MoEForCausalLM(nn.Module, SupportsPP):
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
+
+        # Write profiling data to temp file for external analysis
+        if MiniCPM5MoEDecoderLayer._is_profile_enabled():
+            data = MiniCPM5MoEDecoderLayer._profile_data
+            if len(data) >= 28 and len(data) % 28 == 0:
+                import json as _json
+                profile_path = os.environ.get(
+                    "MINICPM5_PROFILE_PATH", "/tmp/minicpm5_profile.jsonl")
+                with open(profile_path, "w") as f:
+                    for row in data:
+                        f.write(_json.dumps(row) + "\n")
+
         return hidden_states
+
+    @staticmethod
+    def _dump_profile_summary(data, total_steps):
+        """Print profiling summary grouped by prefill vs decode."""
+        import collections
+        import sys
+
+        if not data:
+            return
+
+        by_step = collections.defaultdict(list)
+        for step, layer_idx, attn_ms, mlp_ms, total_ms, n_tokens in data:
+            by_step[step].append((layer_idx, attn_ms, mlp_ms, total_ms, n_tokens))
+
+        steps = sorted(by_step.keys())
+        if not steps:
+            return
+
+        prefill_steps = []
+        decode_steps = []
+        for s in steps:
+            n_tok = by_step[s][0][4]
+            if n_tok > 1:
+                prefill_steps.append(s)
+            else:
+                decode_steps.append(s)
+
+        print(f"\n{'='*80}", file=sys.stderr)
+        print(f"  MINICPM5 PROFILE: {len(prefill_steps)} prefill, "
+              f"{len(decode_steps)} decode steps", file=sys.stderr)
+        print(f"{'='*80}", file=sys.stderr)
+
+        for phase, step_list in [("PREFILL", prefill_steps),
+                                  ("DECODE", decode_steps)]:
+            if not step_list:
+                continue
+
+            attn_total = 0.0
+            mlp_total = 0.0
+            all_total = 0.0
+            n_tokens_first = by_step[step_list[0]][0][4]
+
+            attn_per_layer = collections.defaultdict(float)
+            mlp_per_layer = collections.defaultdict(float)
+
+            for s in step_list:
+                for layer_idx, attn_ms, mlp_ms, total_ms, n_tokens in by_step[s]:
+                    attn_total += attn_ms
+                    mlp_total += mlp_ms
+                    all_total += total_ms
+                    attn_per_layer[layer_idx] += attn_ms
+                    mlp_per_layer[layer_idx] += mlp_ms
+
+            n_steps = len(step_list)
+            other_total = all_total - attn_total - mlp_total
+
+            print(f"\n  --- {phase} ({n_steps} steps, {n_tokens_first} tok/step) ---",
+                  file=sys.stderr)
+            print(f"  Total: {all_total:.1f} ms", file=sys.stderr)
+            print(f"    Attention: {attn_total:.1f} ms "
+                  f"({attn_total/all_total*100:.1f}%)", file=sys.stderr)
+            print(f"    MLP/MoE:   {mlp_total:.1f} ms "
+                  f"({mlp_total/all_total*100:.1f}%)", file=sys.stderr)
+            print(f"    Other:     {other_total:.1f} ms "
+                  f"({other_total/all_total*100:.1f}%)", file=sys.stderr)
+
+            if n_steps > 0:
+                per_step = all_total / n_steps
+                attn_per = attn_total / n_steps
+                mlp_per = mlp_total / n_steps
+                other_per = other_total / n_steps
+                print(f"  Per step: {per_step:.2f} ms = {attn_per:.2f} attn"
+                      f" + {mlp_per:.2f} mlp + {other_per:.2f} other",
+                      file=sys.stderr)
+
+            for li in [0, 1, 14, 27]:
+                ltype = "dense" if li == 0 else "MoE"
+                a = attn_per_layer[li] / n_steps if n_steps else 0
+                m = mlp_per_layer[li] / n_steps if n_steps else 0
+                print(f"    L{li:2d}({ltype}): attn={a:.2f} mlp={m:.2f} ms",
+                      file=sys.stderr)
+
+        print(f"{'='*80}\n", file=sys.stderr)
+        sys.stderr.flush()
 
     def compute_logits(
         self,

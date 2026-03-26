@@ -1693,6 +1693,41 @@ def fused_experts_impl(
     if global_num_experts == -1:
         global_num_experts = E
     top_k_num = topk_ids.size(1)
+
+    # === MOE INSPECT: dump tensor shapes on first decode call ===
+    import os as _os
+    if (_os.environ.get("MINICPM5_MOE_INSPECT") == "1"
+            and num_tokens == 1
+            and not getattr(fused_experts_impl, '_inspected', False)):
+        fused_experts_impl._inspected = True
+        import sys
+        P = lambda *a: print(*a, file=sys.stderr, flush=True)
+        P("\n" + "=" * 80)
+        P("  FUSED_EXPERTS_IMPL — TENSOR LAYOUT DUMP (decode, 1 token)")
+        P("=" * 80)
+        P(f"  hidden_states:  {hidden_states.shape} {hidden_states.dtype}")
+        P(f"  w1 (gate_up):   {w1.shape} {w1.dtype} strides={w1.stride()}")
+        P(f"  w2 (down):      {w2.shape} {w2.dtype} strides={w2.stride()}")
+        P(f"  E={E}, N={N} (2*inter_packed), K={K} (hidden)")
+        P(f"  topk_weights:   {topk_weights.shape} {topk_weights.dtype}")
+        P(f"    values: {topk_weights[0,:8].tolist()}")
+        P(f"  topk_ids:       {topk_ids.shape} {topk_ids.dtype}")
+        P(f"    values: {topk_ids[0].tolist()}")
+        P(f"  use_int4_w4a16={use_int4_w4a16}, use_fp8_w8a8={use_fp8_w8a8}")
+        P(f"  global_num_experts={global_num_experts}")
+        if w1_scale is not None:
+            P(f"  w1_scale:       {w1_scale.shape} {w1_scale.dtype}")
+        if w2_scale is not None:
+            P(f"  w2_scale:       {w2_scale.shape} {w2_scale.dtype}")
+        if w1_zp is not None:
+            P(f"  w1_zp:          {w1_zp.shape} {w1_zp.dtype}")
+        if w2_zp is not None:
+            P(f"  w2_zp:          {w2_zp.shape} {w2_zp.dtype}")
+        if block_shape is not None:
+            P(f"  block_shape:    {block_shape}")
+        P(f"  expert_map:     {expert_map}")
+        P("=" * 80 + "\n")
+
     # We execute the fused_moe kernel in chunks to circumvent this issue:
     # https://github.com/vllm-project/vllm/issues/5938
     CHUNK_SIZE = envs.VLLM_FUSED_MOE_CHUNK_SIZE
@@ -1851,6 +1886,24 @@ def fused_experts_impl(
             )
             num_tokens_post_padded.fill_(max_num_tokens_padded)
             sorted_token_ids = None
+
+        # Inspect intermediate buffer shapes
+        if (_os.environ.get("MINICPM5_MOE_INSPECT") == "1"
+                and num_tokens == 1
+                and not getattr(fused_experts_impl, '_buf_inspected', False)):
+            fused_experts_impl._buf_inspected = True
+            import sys
+            P = lambda *a: print(*a, file=sys.stderr, flush=True)
+            P("\n  --- INTERMEDIATE BUFFERS ---")
+            P(f"  intermediate_cache1 (gate_up out): {intermediate_cache1.shape} "
+              f"{intermediate_cache1.dtype}")
+            P(f"  intermediate_cache2 (activated):   {intermediate_cache2.shape} "
+              f"{intermediate_cache2.dtype}")
+            P(f"  intermediate_cache3 (down out):    {intermediate_cache3.shape} "
+              f"{intermediate_cache3.dtype}")
+            P(f"  sorted_token_ids: {sorted_token_ids.shape if sorted_token_ids is not None else None}")
+            P(f"  expert_ids: {expert_ids.shape}")
+            P(f"  config: {config}")
 
         dispatch_fused_moe_kernel(
             qcurr_hidden_states,
