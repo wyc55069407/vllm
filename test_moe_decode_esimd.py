@@ -215,54 +215,130 @@ def test_perf(M, K, N, E, topk, group_size, dtype, device="xpu",
     return avg_us, bandwidth_gbs
 
 
+def test_correctness_ts(M, K, N, E, topk, group_size, dtype, device="xpu"):
+    """Test ESIMD transposed-scales kernel vs PyTorch reference."""
+    from vllm_kernel_custom.esimd_ops import esimd_moe_decode_ts
+
+    x, w13_qw, w13_s, w2_qw, w2_s, tw, ti, output = make_test_data(
+        M, K, N, E, topk, group_size, dtype, device)
+
+    # Create transposed scales
+    w13_s_t = w13_s.permute(0, 2, 1).contiguous()  # [E, K/GS, 2*N]
+    w2_s_t = w2_s.permute(0, 2, 1).contiguous()    # [E, N/GS, K]
+
+    # Run reference (uses original layout)
+    ref = ref_moe_decode(x, w13_qw, w13_s, w2_qw, w2_s, tw, ti, group_size)
+
+    # Run ESIMD _ts kernel
+    esimd_moe_decode_ts(x, w13_qw, w13_s_t, w2_qw, w2_s_t, tw, ti, output, group_size)
+    torch.xpu.synchronize()
+
+    diff = (output.float() - ref.float()).abs()
+    ref_abs = ref.float().abs()
+    max_abs_err = diff.max().item()
+    rel_rms = (diff ** 2).mean().sqrt().item() / (ref_abs.mean().item() + 1e-8)
+
+    status = "PASS" if rel_rms < 0.05 else "FAIL"
+    print(f"  [{status}] M={M}, K={K}, N={N}, E={E}, topk={topk}, GS={group_size}, "
+          f"dtype={dtype}: max_abs={max_abs_err:.4f}, rel_rms={rel_rms:.6f}")
+    return status == "PASS"
+
+
+def test_perf_ts(M, K, N, E, topk, group_size, dtype, device="xpu",
+                 warmup=10, iters=100, num_buffers=32):
+    """Benchmark ESIMD MoE decode with transposed scales."""
+    from vllm_kernel_custom.esimd_ops import esimd_moe_decode_ts
+
+    buffers = []
+    for _ in range(num_buffers):
+        data = make_test_data(M, K, N, E, topk, group_size, dtype, device)
+        # Transpose scales
+        w13_s_t = data[2].permute(0, 2, 1).contiguous()
+        w2_s_t = data[4].permute(0, 2, 1).contiguous()
+        buffers.append((data[0], data[1], w13_s_t, data[3], w2_s_t,
+                        data[5], data[6], data[7]))
+
+    for i in range(warmup):
+        buf = buffers[i % num_buffers]
+        esimd_moe_decode_ts(buf[0], buf[1], buf[2], buf[3], buf[4],
+                            buf[5], buf[6], buf[7], group_size)
+    torch.xpu.synchronize()
+
+    start = time.perf_counter()
+    for i in range(iters):
+        buf = buffers[i % num_buffers]
+        esimd_moe_decode_ts(buf[0], buf[1], buf[2], buf[3], buf[4],
+                            buf[5], buf[6], buf[7], group_size)
+    torch.xpu.synchronize()
+    elapsed = time.perf_counter() - start
+
+    avg_us = elapsed / iters * 1e6
+
+    bytes_per_elem = 2
+    total_expert_calls = M * topk
+    read_bytes = (
+        M * K * bytes_per_elem
+        + total_expert_calls * (2 * N * K // 2)
+        + total_expert_calls * (2 * N * (K // group_size) * bytes_per_elem)
+        + total_expert_calls * (K * N // 2)
+        + total_expert_calls * (K * (N // group_size) * bytes_per_elem)
+        + M * topk * 4 + M * topk * 4
+    )
+    write_bytes = (
+        total_expert_calls * N * bytes_per_elem
+        + total_expert_calls * K * bytes_per_elem
+        + M * K * bytes_per_elem
+    )
+    total_bytes = read_bytes + write_bytes
+    bandwidth_gbs = total_bytes / (avg_us * 1e-6) / 1e9
+
+    print(f"  M={M}, K={K}, N={N}, E={E}, topk={topk}, GS={group_size}, "
+          f"dtype={dtype}: {avg_us:.1f} us, "
+          f"traffic={total_bytes/1e6:.2f} MB, BW={bandwidth_gbs:.1f} GB/s")
+    return avg_us, bandwidth_gbs
+
+
 def main():
     parser = argparse.ArgumentParser(description="ESIMD MoE decode kernel ULT")
     parser.add_argument("--perf", action="store_true", help="Run perf benchmark")
     parser.add_argument("--all", action="store_true", help="Run correctness + perf")
+    parser.add_argument("--ts", action="store_true", help="Test transposed-scales variant")
     args = parser.parse_args()
 
     device = "xpu"
     print("=" * 70)
-    print("ESIMD MoE Decode Kernel — Unit Level Test")
+    variant = "Transposed-Scales" if args.ts else "Original"
+    print(f"ESIMD MoE Decode Kernel — Unit Level Test ({variant})")
     print("=" * 70)
 
     run_correctness = not args.perf or args.all
     run_perf = args.perf or args.all
 
+    test_configs = [
+        # (M, K, N, E, topk, GS, dtype)
+        (1, 128, 64,  8,  2,  32, torch.bfloat16),
+        (1, 128, 64,  8,  2,  64, torch.bfloat16),
+        (1, 128, 128, 8,  2, 128, torch.bfloat16),
+        (1, 128, 64,  8,  2,  32, torch.float16),
+        (1, 128, 64,  8,  2,  64, torch.float16),
+        (2, 128, 64,  8,  4,  32, torch.bfloat16),
+        (4, 128, 64, 16,  4,  64, torch.bfloat16),
+        (8, 256, 128, 16,  4, 128, torch.bfloat16),
+        (8, 256, 128, 16,  4, 128, torch.float16),
+        (1, 2048, 512, 160, 16, 128, torch.bfloat16),
+        (1, 2048, 512, 160, 16, 128, torch.float16),
+        (4, 2048, 512, 160, 16, 128, torch.bfloat16),
+        (8, 2048, 512, 160, 16, 128, torch.bfloat16),
+    ]
+
     if run_correctness:
         print("\n--- Correctness Tests ---")
         all_pass = True
-
-        # Sweep configs
-        test_configs = [
-            # (M, K, N, E, topk, GS, dtype)
-            # Small configs for quick validation
-            (1, 128, 64,  8,  2,  32, torch.bfloat16),
-            (1, 128, 64,  8,  2,  64, torch.bfloat16),
-            (1, 128, 128, 8,  2, 128, torch.bfloat16),
-            (1, 128, 64,  8,  2,  32, torch.float16),
-            (1, 128, 64,  8,  2,  64, torch.float16),
-
-            # Multi-token decode
-            (2, 128, 64,  8,  4,  32, torch.bfloat16),
-            (4, 128, 64, 16,  4,  64, torch.bfloat16),
-            (8, 256, 128, 16,  4, 128, torch.bfloat16),
-            (8, 256, 128, 16,  4, 128, torch.float16),
-
-            # MiniCPM5-like config: K=2048, N=512, E=160, topk=16, GS=128
-            (1, 2048, 512, 160, 16, 128, torch.bfloat16),
-            (1, 2048, 512, 160, 16, 128, torch.float16),
-
-            # Larger multi-token MiniCPM5
-            (4, 2048, 512, 160, 16, 128, torch.bfloat16),
-            (8, 2048, 512, 160, 16, 128, torch.bfloat16),
-        ]
-
+        test_fn = test_correctness_ts if args.ts else test_correctness
         for M, K, N, E, topk, gs, dtype in test_configs:
-            passed = test_correctness(M, K, N, E, topk, gs, dtype, device)
+            passed = test_fn(M, K, N, E, topk, gs, dtype, device)
             if not passed:
                 all_pass = False
-
         print(f"\nOverall: {'ALL PASS' if all_pass else 'SOME FAILED'}")
 
     if run_perf:
@@ -270,11 +346,11 @@ def main():
         print("MiniCPM5 config: E=160, K=2048, N=512, topk=16, GS=128")
         print(f"Buffer rotation: 32 buffers for cache busting")
         print()
-
+        perf_fn = test_perf_ts if args.ts else test_perf
         for M in [1, 2, 4, 8]:
             for dtype in [torch.bfloat16, torch.float16]:
-                test_perf(M, K=2048, N=512, E=160, topk=16,
-                          group_size=128, dtype=dtype, device=device)
+                perf_fn(M, K=2048, N=512, E=160, topk=16,
+                        group_size=128, dtype=dtype, device=device)
 
 
 if __name__ == "__main__":

@@ -77,6 +77,201 @@ SYCL_ESIMD_FUNCTION inline float dequant_dot(
 }
 
 
+/* ─── Helper: Fused dequant + dot product (transposed scales) ─────────────
+ * Same as dequant_dot but loads scales with stride (for transposed layout).
+ * Transposed scales: [E, K/GS, 2*N] or [E, N/GS, K]
+ * Scale for group g at row r: scale_ptr[g * scale_stride + r]
+ * Here scale_ptr points to (first_group * scale_stride + row), stride between
+ * consecutive groups = scale_stride.
+ */
+template<typename IT, int GS, int VL>
+SYCL_ESIMD_FUNCTION inline float dequant_dot_ts(
+    const uint8_t* packed_ptr,
+    const IT* scale_ptr,
+    int scale_stride,
+    simd<float, VL>& input_f) {
+
+    constexpr int NUM_BLOCKS = VL / GS;
+
+    simd<uint8_t, VL / 2> packed = block_load<uint8_t, VL / 2>(packed_ptr);
+
+    // Load scales with stride (non-contiguous)
+    simd<float, NUM_BLOCKS> scales;
+    #pragma unroll
+    for (int i = 0; i < NUM_BLOCKS; i++) {
+        scales[i] = (float)scale_ptr[i * scale_stride];
+    }
+
+    float acc = 0.f;
+
+    #pragma unroll
+    for (int blk = 0; blk < NUM_BLOCKS; blk++) {
+        float sc = scales[blk];
+        int poff = blk * (GS / 2);
+
+        auto p = packed.template select<GS / 2, 1>(poff);
+        simd<float, GS / 2> lo = p & 0x0F;
+        simd<float, GS / 2> hi = (p >> 4) & 0x0F;
+        lo = (lo - 8.0f) * sc;
+        hi = (hi - 8.0f) * sc;
+
+        int base = blk * GS;
+        auto in_lo = input_f.template select<GS / 2, 2>(base + 0);
+        auto in_hi = input_f.template select<GS / 2, 2>(base + 1);
+        acc += reduce<float>(in_lo * lo + in_hi * hi, std::plus<>());
+    }
+    return acc;
+}
+
+
+/* ─── Up+Gate+SiLU fused kernel (multi-row, transposed scales) ────────────
+ * Same as moe_up_gate_silu_rows but reads scales from transposed layout:
+ *   w13_scales_t: [E, K/GS, 2*N]
+ */
+template<typename IT, int GS, int VL, int ROWS>
+void moe_up_gate_silu_rows_ts(
+    const IT* __restrict__ x,              // [M, K]
+    const uint8_t* __restrict__ w13,       // [E, 2*N, K/2]
+    const IT* __restrict__ w13_scales_t,   // [E, K/GS, 2*N]  (transposed)
+    const int* __restrict__ topk_ids,      // [M, topk]
+    IT* __restrict__ intermediates,        // [M*topk, N]
+    const int M, const int N, const int K,
+    const int topk, const int num_experts,
+    sycl::nd_item<3> item) {
+
+    const int token = item.get_global_id(0);
+    const int slot  = item.get_global_id(1);
+    const int rg    = item.get_global_id(2);
+
+    if (token >= M || slot >= topk) return;
+    const int base_row = rg * ROWS;
+    if (base_row >= N) return;
+
+    const int eid = topk_ids[token * topk + slot];
+    const int out_off = (token * topk + slot) * N + base_row;
+
+    if (eid < 0 || eid >= num_experts) {
+        #pragma unroll
+        for (int r = 0; r < ROWS; r++)
+            if (base_row + r < N)
+                intermediates[out_off + r] = IT(0);
+        return;
+    }
+
+    const int half_K = K / 2;
+    const int nsg = K / GS;       // number of scale groups along K
+    const int two_N = 2 * N;
+    const IT* xptr = x + (size_t)token * K;
+
+    const size_t expert_w_base = (size_t)eid * two_N * half_K;
+    // Transposed: [E, K/GS, 2*N] — expert base is same total size
+    const size_t expert_s_base = (size_t)eid * nsg * two_N;
+
+    float gate_sums[ROWS] = {};
+    float up_sums[ROWS] = {};
+
+    for (int k = 0; k < K; k += VL) {
+        simd<float, VL> input_f = convert<float>(block_load<IT, VL>(xptr + k));
+
+        #pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            int row = base_row + r;
+            if (row >= N) break;
+
+            // Transposed scale: base + (k/GS) * two_N + row
+            gate_sums[r] += dequant_dot_ts<IT, GS, VL>(
+                w13 + expert_w_base + (size_t)row * half_K + k / 2,
+                w13_scales_t + expert_s_base + (size_t)(k / GS) * two_N + row,
+                two_N,
+                input_f);
+            up_sums[r] += dequant_dot_ts<IT, GS, VL>(
+                w13 + expert_w_base + (size_t)(N + row) * half_K + k / 2,
+                w13_scales_t + expert_s_base + (size_t)(k / GS) * two_N + (N + row),
+                two_N,
+                input_f);
+        }
+    }
+
+    #pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        if (base_row + r >= N) break;
+        float g = gate_sums[r];
+        float u = up_sums[r];
+        float silu_g = g / (1.f + sycl::exp(-g));
+        intermediates[out_off + r] = IT(silu_g * u);
+    }
+}
+
+
+/* ─── Down projection kernel (multi-row, transposed scales) ───────────────
+ * Same as moe_down_rows but reads scales from transposed layout:
+ *   w2_scales_t: [E, N/GS, K]
+ */
+template<typename IT, int GS, int VL_D, int ROWS>
+void moe_down_rows_ts(
+    const IT* __restrict__ intermediates, // [M*topk, N]
+    const uint8_t* __restrict__ w2,       // [E, K, N/2]
+    const IT* __restrict__ w2_scales_t,   // [E, N/GS, K]  (transposed)
+    const int* __restrict__ topk_ids,     // [M, topk]
+    IT* __restrict__ down_out,            // [M*topk, K]
+    const int M, const int N, const int K,
+    const int topk, const int num_experts,
+    sycl::nd_item<3> item) {
+
+    const int token = item.get_global_id(0);
+    const int slot  = item.get_global_id(1);
+    const int rg    = item.get_global_id(2);
+
+    if (token >= M || slot >= topk) return;
+    const int base_row = rg * ROWS;
+    if (base_row >= K) return;
+
+    const int eid = topk_ids[token * topk + slot];
+    const int out_off = (token * topk + slot) * K + base_row;
+
+    if (eid < 0 || eid >= num_experts) {
+        #pragma unroll
+        for (int r = 0; r < ROWS; r++)
+            if (base_row + r < K)
+                down_out[out_off + r] = IT(0);
+        return;
+    }
+
+    const int half_N = N / 2;
+    const int nsg = N / GS;       // number of scale groups along N
+    const IT* hi = intermediates + (size_t)(token * topk + slot) * N;
+
+    const size_t expert_w_base = (size_t)eid * K * half_N;
+    // Transposed: [E, N/GS, K] — expert base is same total size
+    const size_t expert_s_base = (size_t)eid * nsg * K;
+
+    float row_sums[ROWS] = {};
+
+    for (int n = 0; n < N; n += VL_D) {
+        simd<float, VL_D> hi_f = convert<float>(block_load<IT, VL_D>(hi + n));
+
+        #pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            int row = base_row + r;
+            if (row >= K) break;
+
+            // Transposed scale: base + (n/GS) * K + row
+            row_sums[r] += dequant_dot_ts<IT, GS, VL_D>(
+                w2 + expert_w_base + (size_t)row * half_N + n / 2,
+                w2_scales_t + expert_s_base + (size_t)(n / GS) * K + row,
+                K,
+                hi_f);
+        }
+    }
+
+    #pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        if (base_row + r >= K) break;
+        down_out[out_off + r] = IT(row_sums[r]);
+    }
+}
+
+
 /* ─── Up+Gate+SiLU fused kernel (multi-row) ───────────────────────────────
  *
  * 1 thread = ROWS output elements (gate + up for ROWS rows of one expert)

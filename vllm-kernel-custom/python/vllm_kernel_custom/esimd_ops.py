@@ -346,6 +346,25 @@ def esimd_moe_decode(
         output, group_size)
 
 
+def esimd_moe_decode_ts(
+    x: torch.Tensor, w13_qweight: torch.Tensor, w13_scales_t: torch.Tensor,
+    w2_qweight: torch.Tensor, w2_scales_t: torch.Tensor,
+    topk_weights: torch.Tensor, topk_ids: torch.Tensor,
+    output: torch.Tensor, group_size: int,
+) -> torch.Tensor:
+    """Fused MoE decode with transposed scales (W4A16 GPTQ INT4 symmetric).
+
+    Same as esimd_moe_decode but scales are transposed for better access pattern:
+        w13_scales_t: [E, K/GS, 2*N]  (original: [E, 2*N, K/GS])
+        w2_scales_t:  [E, N/GS, K]    (original: [E, K, N/GS])
+    """
+    return _ops.esimd_moe_decode_ts(
+        x, w13_qweight, w13_scales_t,
+        w2_qweight, w2_scales_t,
+        topk_weights, topk_ids,
+        output, group_size)
+
+
 # ============================================================
 # oneDNN ops (common_ops)
 # ============================================================

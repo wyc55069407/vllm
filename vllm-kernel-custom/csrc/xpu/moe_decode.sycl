@@ -89,6 +89,52 @@ static void launch_gather(
 }
 
 
+/* ─── Up+Gate+SiLU dispatch (transposed scales) ───────────────────────────*/
+template<typename IT, int GS, int VL>
+static void launch_up_gate_silu_ts(
+    const IT* x, const uint8_t* w13, const IT* w13_scales_t,
+    const int* topk_ids, IT* intermediates,
+    int M, int N, int K, int topk, int num_experts,
+    sycl::queue& q) {
+
+    int N_groups = (N + ROWS_UP - 1) / ROWS_UP;
+    auto range = sycl::nd_range<3>(
+        sycl::range<3>(M, topk, N_groups),
+        sycl::range<3>(1, 1, 1));
+
+    q.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(range, [=](sycl::nd_item<3> item) SYCL_ESIMD_KERNEL {
+            moe_up_gate_silu_rows_ts<IT, GS, VL, ROWS_UP>(
+                x, w13, w13_scales_t, topk_ids, intermediates,
+                M, N, K, topk, num_experts, item);
+        });
+    });
+}
+
+
+/* ─── Down projection dispatch (transposed scales) ────────────────────────*/
+template<typename IT, int GS, int VL_D>
+static void launch_down_ts(
+    const IT* intermediates, const uint8_t* w2, const IT* w2_scales_t,
+    const int* topk_ids, IT* down_out,
+    int M, int N, int K, int topk, int num_experts,
+    sycl::queue& q) {
+
+    int K_groups = (K + ROWS_DN - 1) / ROWS_DN;
+    auto range = sycl::nd_range<3>(
+        sycl::range<3>(M, topk, K_groups),
+        sycl::range<3>(1, 1, 1));
+
+    q.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(range, [=](sycl::nd_item<3> item) SYCL_ESIMD_KERNEL {
+            moe_down_rows_ts<IT, GS, VL_D, ROWS_DN>(
+                intermediates, w2, w2_scales_t, topk_ids, down_out,
+                M, N, K, topk, num_experts, item);
+        });
+    });
+}
+
+
 /* ─── Fused MoE decode: up_gate_silu + down + gather ────────────────────────*/
 at::Tensor esimd_moe_decode(
     at::Tensor x,
@@ -197,6 +243,111 @@ at::Tensor esimd_moe_decode(
 
     #undef DISPATCH_DTYPE
     #undef DISPATCH_GS
+
+    return output;
+}
+
+
+/* ─── Fused MoE decode with transposed scales ────────────────────────────────
+ * Same pipeline but reads scales from transposed layout:
+ *   w13_scales_t: [E, K/GS, 2*N]   (original: [E, 2*N, K/GS])
+ *   w2_scales_t:  [E, N/GS, K]     (original: [E, K, N/GS])
+ */
+at::Tensor esimd_moe_decode_ts(
+    at::Tensor x,
+    at::Tensor w13_qweight,
+    at::Tensor w13_scales_t,
+    at::Tensor w2_qweight,
+    at::Tensor w2_scales_t,
+    at::Tensor topk_weights,
+    at::Tensor topk_ids,
+    at::Tensor output,
+    int64_t group_size) {
+
+    TORCH_CHECK(x.dim() == 2, "x must be 2D [M, K]");
+    TORCH_CHECK(w13_qweight.dim() == 3, "w13_qweight must be 3D [E, 2*N, K/2]");
+    TORCH_CHECK(w2_qweight.dim() == 3, "w2_qweight must be 3D [E, K, N/2]");
+
+    const int M = x.size(0);
+    const int K = x.size(1);
+    const int num_experts = w13_qweight.size(0);
+    const int N = w13_qweight.size(1) / 2;
+    const int topk = topk_ids.size(1);
+
+    TORCH_CHECK(M >= 1 && M <= 8, "M must be 1..8 for decode");
+    TORCH_CHECK(K % 64 == 0, "K must be multiple of 64");
+    TORCH_CHECK(N % 64 == 0, "N must be multiple of 64");
+    TORCH_CHECK(group_size == 32 || group_size == 64 || group_size == 128,
+                "group_size must be 32, 64, or 128");
+
+    // Check transposed scale shapes: [E, K/GS, 2*N] and [E, N/GS, K]
+    TORCH_CHECK(w13_scales_t.size(0) == num_experts);
+    TORCH_CHECK(w13_scales_t.size(1) == K / group_size);
+    TORCH_CHECK(w13_scales_t.size(2) == 2 * N);
+    TORCH_CHECK(w2_scales_t.size(0) == num_experts);
+    TORCH_CHECK(w2_scales_t.size(1) == N / group_size);
+    TORCH_CHECK(w2_scales_t.size(2) == K);
+
+    sycl::queue& queue = c10::xpu::getCurrentXPUStream(x.device().index()).queue();
+
+    auto intermediates = at::empty({M * topk, N},
+        at::TensorOptions().device(x.device()).dtype(x.scalar_type()));
+    auto down_out = at::empty({M * topk, K},
+        at::TensorOptions().device(x.device()).dtype(x.scalar_type()));
+
+    #define LAUNCH_UP_TS(IT, gs, vl) \
+        launch_up_gate_silu_ts<IT, gs, vl>( \
+            (const IT*)x.data_ptr(), \
+            (const uint8_t*)w13_qweight.data_ptr(), \
+            (const IT*)w13_scales_t.data_ptr(), \
+            topk_ids.data_ptr<int>(), \
+            (IT*)intermediates.data_ptr(), \
+            M, N, K, topk, num_experts, queue)
+
+    #define LAUNCH_DN_TS(IT, gs, vl) \
+        launch_down_ts<IT, gs, vl>( \
+            (const IT*)intermediates.data_ptr(), \
+            (const uint8_t*)w2_qweight.data_ptr(), \
+            (const IT*)w2_scales_t.data_ptr(), \
+            topk_ids.data_ptr<int>(), \
+            (IT*)down_out.data_ptr(), \
+            M, N, K, topk, num_experts, queue)
+
+    #define DISPATCH_GS_TS(IT, gs) do { \
+        if (K >= 4 * gs) { LAUNCH_UP_TS(IT, gs, 4 * gs); } \
+        else if (K >= 2 * gs) { LAUNCH_UP_TS(IT, gs, 2 * gs); } \
+        else { LAUNCH_UP_TS(IT, gs, gs); } \
+        if (N >= 4 * gs) { LAUNCH_DN_TS(IT, gs, 4 * gs); } \
+        else if (N >= 2 * gs) { LAUNCH_DN_TS(IT, gs, 2 * gs); } \
+        else { LAUNCH_DN_TS(IT, gs, gs); } \
+        launch_gather<IT>( \
+            (const IT*)down_out.data_ptr(), \
+            topk_weights.data_ptr<float>(), \
+            (IT*)output.data_ptr(), \
+            M, K, topk, queue); \
+    } while(0)
+
+    #define DISPATCH_DTYPE_TS(IT) do { \
+        switch (group_size) { \
+            case 32:  DISPATCH_GS_TS(IT, 32);  break; \
+            case 64:  DISPATCH_GS_TS(IT, 64);  break; \
+            case 128: DISPATCH_GS_TS(IT, 128); break; \
+        } \
+    } while(0)
+
+    switch (x.scalar_type()) {
+        case at::kHalf:
+            DISPATCH_DTYPE_TS(fp16);
+            break;
+        case at::kBFloat16:
+            DISPATCH_DTYPE_TS(bf16);
+            break;
+        default:
+            TORCH_CHECK(false, "esimd_moe_decode_ts: unsupported dtype");
+    }
+
+    #undef DISPATCH_DTYPE_TS
+    #undef DISPATCH_GS_TS
 
     return output;
 }

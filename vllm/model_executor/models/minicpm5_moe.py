@@ -16,9 +16,11 @@ from collections.abc import Callable, Iterable
 
 # ESIMD MoE decode kernel (optional, enabled by MINICPM5_ESIMD_MOE=1)
 _esimd_moe_decode = None
+_esimd_moe_decode_ts = None
 if os.environ.get("MINICPM5_ESIMD_MOE", "0") == "1":
     try:
         from vllm_kernel_custom.esimd_ops import esimd_moe_decode as _esimd_moe_decode
+        from vllm_kernel_custom.esimd_ops import esimd_moe_decode_ts as _esimd_moe_decode_ts
     except ImportError:
         pass
 
@@ -327,6 +329,22 @@ class MiniCPM5MoEMoE(nn.Module):
     _moe_inspected = False
     _esimd_logged = False
 
+    def _ensure_transposed_scales(self):
+        """Create transposed scale copies for ESIMD decode (lazy, once)."""
+        if hasattr(self, '_w13_scales_t'):
+            return
+        # w13_scales: [E, 2*N, K/GS] -> [E, K/GS, 2*N]
+        w13_s = self.experts.w13_scales
+        w2_s = self.experts.w2_scales
+        self._w13_scales_t = w13_s.permute(0, 2, 1).contiguous()
+        self._w2_scales_t = w2_s.permute(0, 2, 1).contiguous()
+        logger.warning(
+            "ESIMD MoE: created transposed scales — "
+            "w13_scales_t %s, w2_scales_t %s",
+            list(self._w13_scales_t.shape),
+            list(self._w2_scales_t.shape),
+        )
+
     def _esimd_forward(
         self, hidden_states: torch.Tensor, num_tokens: int, hidden_dim: int
     ) -> torch.Tensor:
@@ -348,20 +366,40 @@ class MiniCPM5MoEMoE(nn.Module):
         group_size = self.experts.group_size
         output = torch.zeros_like(hidden_states)
 
-        # Ensure scales match input dtype
-        w13_scales = self.experts.w13_scales
-        w2_scales = self.experts.w2_scales
-        if w13_scales.dtype != hidden_states.dtype:
-            w13_scales = w13_scales.to(hidden_states.dtype)
-            w2_scales = w2_scales.to(hidden_states.dtype)
+        # Use original (non-transposed) scale layout — faster than transposed
+        # (block_load on contiguous K/GS dim beats strided scalar loads)
+        # Transposed variant available via MINICPM5_ESIMD_MOE_TS=1 for testing
+        use_ts = (os.environ.get("MINICPM5_ESIMD_MOE_TS", "0") == "1"
+                  and _esimd_moe_decode_ts is not None)
+        if use_ts:
+            self._ensure_transposed_scales()
+            w13_scales_t = self._w13_scales_t
+            w2_scales_t = self._w2_scales_t
+            if w13_scales_t.dtype != hidden_states.dtype:
+                w13_scales_t = w13_scales_t.to(hidden_states.dtype)
+                w2_scales_t = w2_scales_t.to(hidden_states.dtype)
 
-        _esimd_moe_decode(
-            hidden_states,
-            self.experts.w13_qweight, w13_scales,
-            self.experts.w2_qweight, w2_scales,
-            topk_weights, topk_ids,
-            output, group_size,
-        )
+            _esimd_moe_decode_ts(
+                hidden_states,
+                self.experts.w13_qweight, w13_scales_t,
+                self.experts.w2_qweight, w2_scales_t,
+                topk_weights, topk_ids,
+                output, group_size,
+            )
+        else:
+            w13_scales = self.experts.w13_scales
+            w2_scales = self.experts.w2_scales
+            if w13_scales.dtype != hidden_states.dtype:
+                w13_scales = w13_scales.to(hidden_states.dtype)
+                w2_scales = w2_scales.to(hidden_states.dtype)
+
+            _esimd_moe_decode(
+                hidden_states,
+                self.experts.w13_qweight, w13_scales,
+                self.experts.w2_qweight, w2_scales,
+                topk_weights, topk_ids,
+                output, group_size,
+            )
 
         final_hidden_states = output
 
@@ -383,8 +421,10 @@ class MiniCPM5MoEMoE(nn.Module):
         if not MiniCPM5MoEMoE._esimd_logged:
             MiniCPM5MoEMoE._esimd_logged = True
             logger.warning(
-                "ESIMD MoE decode: M=%d, K=%d, topk=%d, group_size=%d",
+                "ESIMD MoE decode: M=%d, K=%d, topk=%d, group_size=%d, "
+                "transposed_scales=%s",
                 num_tokens, hidden_dim, topk, group_size,
+                _esimd_moe_decode_ts is not None,
             )
 
         return final_hidden_states.view(num_tokens, hidden_dim)

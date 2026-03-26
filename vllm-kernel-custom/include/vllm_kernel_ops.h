@@ -204,6 +204,13 @@ at::Tensor esimd_moe_decode(
     at::Tensor topk_weights, at::Tensor topk_ids,
     at::Tensor output, int64_t group_size);
 
+// Same but with transposed scales: w13_scales_t [E, K/GS, 2*N], w2_scales_t [E, N/GS, K]
+at::Tensor esimd_moe_decode_ts(
+    at::Tensor x, at::Tensor w13_qweight, at::Tensor w13_scales_t,
+    at::Tensor w2_qweight, at::Tensor w2_scales_t,
+    at::Tensor topk_weights, at::Tensor topk_ids,
+    at::Tensor output, int64_t group_size);
+
 /* ========== oneDNN ops (common_ops) ========== */
 
 // oneDNN FP8 GEMM: FP16/BF16 x FP8_E4M3, per-N scale

@@ -152,6 +152,13 @@ TORCH_LIBRARY_FRAGMENT(vllm_kernel_custom, m) {
         "Tensor output, int group_size) -> Tensor");
   m.impl("esimd_moe_decode", torch::kXPU, &esimd_moe_decode);
 
+  /* === MoE decode fused ESIMD (transposed scales) === */
+  m.def("esimd_moe_decode_ts(Tensor x, Tensor w13_qweight, Tensor w13_scales_t, "
+        "Tensor w2_qweight, Tensor w2_scales_t, "
+        "Tensor topk_weights, Tensor topk_ids, "
+        "Tensor output, int group_size) -> Tensor");
+  m.impl("esimd_moe_decode_ts", torch::kXPU, &esimd_moe_decode_ts);
+
   /* === oneDNN FP8 GEMM === */
   m.def("onednn_w8a16_fp8(Tensor x, Tensor weight, Tensor scales, "
         "Tensor bias, Tensor output, "
