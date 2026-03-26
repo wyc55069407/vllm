@@ -14,6 +14,14 @@ import time
 import typing
 from collections.abc import Callable, Iterable
 
+# ESIMD MoE decode kernel (optional, enabled by MINICPM5_ESIMD_MOE=1)
+_esimd_moe_decode = None
+if os.environ.get("MINICPM5_ESIMD_MOE", "0") == "1":
+    try:
+        from vllm_kernel_custom.esimd_ops import esimd_moe_decode as _esimd_moe_decode
+    except ImportError:
+        pass
+
 import torch
 from torch import nn
 
@@ -317,6 +325,69 @@ class MiniCPM5MoEMoE(nn.Module):
         )
 
     _moe_inspected = False
+    _esimd_logged = False
+
+    def _esimd_forward(
+        self, hidden_states: torch.Tensor, num_tokens: int, hidden_dim: int
+    ) -> torch.Tensor:
+        """ESIMD MoE decode fast path: routing + ESIMD kernel + shared expert."""
+        # 1. Routing: gate → sigmoid → correction bias → topk → renorm
+        router_logits, _ = self.gate(hidden_states)
+        scores = torch.sigmoid(router_logits.float())
+        if self.gate.e_score_correction_bias is not None:
+            scores = scores + self.gate.e_score_correction_bias.unsqueeze(0)
+
+        topk = self.experts.moe_config.experts_per_token
+        topk_weights, topk_ids = torch.topk(scores, k=topk, dim=-1)
+        topk_ids = topk_ids.to(torch.int32)
+        # Renormalize weights (norm_topk_prob=True)
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        topk_weights = topk_weights.to(torch.float32)
+
+        # 2. ESIMD MoE decode kernel (routed experts)
+        group_size = self.experts.group_size
+        output = torch.zeros_like(hidden_states)
+
+        # Ensure scales match input dtype
+        w13_scales = self.experts.w13_scales
+        w2_scales = self.experts.w2_scales
+        if w13_scales.dtype != hidden_states.dtype:
+            w13_scales = w13_scales.to(hidden_states.dtype)
+            w2_scales = w2_scales.to(hidden_states.dtype)
+
+        _esimd_moe_decode(
+            hidden_states,
+            self.experts.w13_qweight, w13_scales,
+            self.experts.w2_qweight, w2_scales,
+            topk_weights, topk_ids,
+            output, group_size,
+        )
+
+        final_hidden_states = output
+
+        # 3. Shared expert
+        shared_output = None
+        if self.shared_experts is not None:
+            shared_output = self.shared_experts(hidden_states)
+
+        # 4. Apply routed_scaling_factor
+        if hidden_states.dtype != torch.float16:
+            final_hidden_states = final_hidden_states * self.routed_scaling_factor
+        elif shared_output is not None:
+            shared_output = shared_output * (1.0 / self.routed_scaling_factor)
+
+        # 5. Add shared expert output
+        if shared_output is not None:
+            final_hidden_states = final_hidden_states + shared_output
+
+        if not MiniCPM5MoEMoE._esimd_logged:
+            MiniCPM5MoEMoE._esimd_logged = True
+            logger.warning(
+                "ESIMD MoE decode: M=%d, K=%d, topk=%d, group_size=%d",
+                num_tokens, hidden_dim, topk, group_size,
+            )
+
+        return final_hidden_states.view(num_tokens, hidden_dim)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
@@ -324,6 +395,15 @@ class MiniCPM5MoEMoE(nn.Module):
 
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
+
+        # === ESIMD MoE decode fast path (M <= 8) ===
+        if (
+            _esimd_moe_decode is not None
+            and num_tokens <= 8
+            and not self.is_sequence_parallel
+            and self.tp_size == 1
+        ):
+            return self._esimd_forward(hidden_states, num_tokens, hidden_dim)
 
         # === MOE INSPECT: dump shapes on first decode call ===
         do_inspect = (

@@ -2,10 +2,10 @@
  * Pipeline: fused up_gate_silu → down → gather
  * Supports: bf16/fp16 IO, GPTQ INT4 symmetric, variable group_size (32/64/128)
  *
- * v3: dequant_dot fusion + ROWS=4 batching.
+ * v3: dequant_dot fusion + ROWS batching.
  *   - dequant_dot: fused dequant + dot product without full VL weight vector
- *   - ROWS=4: each thread processes 4 output rows, sharing input load
- * Reduces thread count ~4x and L2 input traffic ~4x.
+ *   - ROWS batching: UP=4, DN=8 rows per thread, sharing input load
+ * Reduces thread count and L2 input traffic.
  */
 
 #include <ATen/ATen.h>
