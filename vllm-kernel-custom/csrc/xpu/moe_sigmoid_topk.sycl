@@ -1,0 +1,41 @@
+// moe_sigmoid_topk.sycl — ATen entry for fused sigmoid+topk MoE routing
+// Build: common_ops extension (standard GRF)
+
+#include <torch/all.h>
+#include <c10/xpu/XPUStream.h>
+#include "esimd_kernels/moe_sigmoid_topk.h"
+
+void esimd_moe_sigmoid_topk(
+    at::Tensor logits,            // [M, E] fp16
+    at::Tensor bias,              // [E] float32, or empty tensor if no bias
+    at::Tensor topk_weights,      // [M, topk] float32 (output)
+    at::Tensor topk_ids,          // [M, topk] int32 (output)
+    int64_t num_experts,
+    int64_t topk)
+{
+    TORCH_CHECK(num_experts == 160, "esimd_moe_sigmoid_topk: only E=160 supported");
+    TORCH_CHECK(topk == 16, "esimd_moe_sigmoid_topk: only topk=16 supported");
+    TORCH_CHECK(logits.dim() == 2 && logits.size(1) == num_experts,
+                "logits must be [M, E]");
+    TORCH_CHECK(logits.scalar_type() == at::kHalf,
+                "logits must be fp16");
+
+    const int M = logits.size(0);
+    if (M == 0) return;
+
+    sycl::queue& queue = c10::xpu::getCurrentXPUStream(logits.device().index()).queue();
+
+    const float* bias_ptr = nullptr;
+    if (bias.defined() && bias.numel() > 0) {
+        TORCH_CHECK(bias.scalar_type() == at::kFloat, "bias must be float32");
+        bias_ptr = bias.data_ptr<float>();
+    }
+
+    moe_fused_sigmoid_topk<fp16>(
+        queue,
+        reinterpret_cast<const fp16*>(logits.data_ptr()),
+        bias_ptr,
+        topk_weights.data_ptr<float>(),
+        topk_ids.data_ptr<int>(),
+        M);
+}

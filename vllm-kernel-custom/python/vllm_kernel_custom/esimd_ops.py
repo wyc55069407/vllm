@@ -317,6 +317,32 @@ def esimd_dsa_mega(
 
 
 # ============================================================
+# Fused sigmoid+topk for MoE routing (common_ops)
+# ============================================================
+
+def esimd_moe_sigmoid_topk(
+    logits: torch.Tensor, bias: torch.Tensor,
+    topk_weights: torch.Tensor, topk_ids: torch.Tensor,
+    num_experts: int, topk: int,
+) -> None:
+    """Fused sigmoid + correction_bias + topk + renormalize for MoE routing.
+
+    Replaces: torch.sigmoid + torch.topk + renorm (3 kernel launches → 1).
+    Optimized for MiniCPM5: E=160, topk=16.
+
+    Args:
+        logits:       [M, E]     fp16  — gate output (raw logits)
+        bias:         [E]        fp32  — e_score_correction_bias (or empty tensor)
+        topk_weights: [M, topk]  fp32  — output: renormalized routing weights
+        topk_ids:     [M, topk]  int32 — output: selected expert IDs
+        num_experts:  160
+        topk:         16
+    """
+    _ops.esimd_moe_sigmoid_topk(logits, bias, topk_weights, topk_ids,
+                                num_experts, topk)
+
+
+# ============================================================
 # MoE decode ESIMD ops (common_ops)
 # ============================================================
 
@@ -363,6 +389,44 @@ def esimd_moe_decode_ts(
         w2_qweight, w2_scales_t,
         topk_weights, topk_ids,
         output, group_size)
+
+
+# ============================================================
+# MoE prefill ESIMD ops
+# ============================================================
+
+def esimd_moe_prefill(
+    x: torch.Tensor, w13_qweight: torch.Tensor, w13_scales: torch.Tensor,
+    w13_scales_t: torch.Tensor, w2_qweight: torch.Tensor, w2_scales: torch.Tensor,
+    w2_scales_t: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor,
+    output: torch.Tensor, group_size: int,
+) -> torch.Tensor:
+    """MoE prefill: GGEMV (≤64 tok/expert) + oneDNN (>64) + accumulate.
+
+    Scales: non-transposed for GGEMV, transposed for oneDNN.
+        w13_scales:   [E, 2*N, K/GS]  — GGEMV scatter-gather layout
+        w13_scales_t: [E, K/GS, 2*N]  — oneDNN ab format
+        w2_scales:    [E, K, N/GS]
+        w2_scales_t:  [E, N/GS, K]
+    """
+    return _ops.esimd_moe_prefill(
+        x, w13_qweight, w13_scales, w13_scales_t,
+        w2_qweight, w2_scales, w2_scales_t,
+        topk_weights, topk_ids, output, group_size)
+
+
+def esimd_moe_prefill_ggemv(
+    expert_states: torch.Tensor, w13_qweight: torch.Tensor, w13_scales: torch.Tensor,
+    w2_qweight: torch.Tensor, w2_scales: torch.Tensor,
+    gate_buf: torch.Tensor, intermediate: torch.Tensor, expert_output: torch.Tensor,
+    chunks: torch.Tensor, hidden_size: int, intermediate_size: int,
+) -> torch.Tensor:
+    """GGEMV sub-op for MoE prefill (doubleGRF DPAS kernels)."""
+    return _ops.esimd_moe_prefill_ggemv(
+        expert_states, w13_qweight, w13_scales,
+        w2_qweight, w2_scales,
+        gate_buf, intermediate, expert_output,
+        chunks, hidden_size, intermediate_size)
 
 
 # ============================================================

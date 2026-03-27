@@ -1,0 +1,62 @@
+// moe_prefill_lgrf.sycl — doubleGRF GGEMV dispatch for MoE prefill
+// Build: common_ops_lgrf extension (doubleGRF)
+
+#include <ATen/core/dispatch/Dispatcher.h>
+#include <torch/all.h>
+#include <c10/xpu/XPUStream.h>
+#include "esimd_kernels/moe_prefill_lgrf.h"
+
+// ======================== ATen entry point ========================
+// Runs GGEMV up + silu_mul + down for small experts (nt <= 64).
+// chunks: [num_chunks, 3] int32 tensor where each row = {eid, t0, nt}
+at::Tensor esimd_moe_prefill_ggemv(
+    at::Tensor expert_states,   // [total_seqlen, H] fp16
+    at::Tensor w13_qweight,     // [E, 2*N, H/2] uint8
+    at::Tensor w13_scales,      // [E, 2*N, H/GS] fp16 (non-transposed, GGEMV layout)
+    at::Tensor w2_qweight,      // [E, H, N/2] uint8
+    at::Tensor w2_scales,       // [E, H, N/GS] fp16 (non-transposed, GGEMV layout)
+    at::Tensor gate_buf,        // [total_seqlen, 2*N] fp16
+    at::Tensor intermediate,    // [total_seqlen, N] fp16
+    at::Tensor expert_output,   // [total_seqlen, H] fp16
+    at::Tensor chunks,          // [num_chunks, 3] int32
+    int64_t hidden_size,
+    int64_t intermediate_size)
+{
+    TORCH_CHECK(chunks.dim() == 2 && chunks.size(1) == 3, "chunks must be [num_chunks, 3]");
+    const int num_chunks = chunks.size(0);
+    if (num_chunks <= 0) return expert_output;
+
+    sycl::queue& queue = c10::xpu::getCurrentXPUStream(expert_states.device().index()).queue();
+
+    // Cast chunks to MoePrefillChunkInfo* (same memory layout: 3 ints)
+    const auto* chunks_ptr = reinterpret_cast<const MoePrefillChunkInfo*>(chunks.data_ptr<int>());
+
+    const int H = (int)hidden_size;
+    const int IM = (int)intermediate_size;
+    const int fused_im = 2 * IM;
+
+    // GGEMV scale layout: [E, rows, nblocks] where nblocks = dim/BS
+    // For w13: [E, 2*N, H/BS], for w2: [E, H, N/BS]
+    const fp16* es_ptr = reinterpret_cast<const fp16*>(expert_states.data_ptr());
+    const uint8_t* w13_ptr = w13_qweight.data_ptr<uint8_t>();
+    const fp16* w13_s_ptr = reinterpret_cast<const fp16*>(w13_scales.data_ptr());
+    const uint8_t* w2_ptr = w2_qweight.data_ptr<uint8_t>();
+    const fp16* w2_s_ptr = reinterpret_cast<const fp16*>(w2_scales.data_ptr());
+    fp16* gb_ptr = reinterpret_cast<fp16*>(gate_buf.data_ptr());
+    fp16* inter_ptr = reinterpret_cast<fp16*>(intermediate.data_ptr());
+    fp16* out_ptr = reinterpret_cast<fp16*>(expert_output.data_ptr());
+
+    // Up+Gate: fused [E, 2*IM, H/2] weight, [E, 2*IM, H/GS] scale
+    moe_up_forward_v29(queue, es_ptr, w13_ptr, w13_s_ptr,
+                        gb_ptr, chunks_ptr, num_chunks, H, IM);
+
+    // SiLU * mul
+    moe_silu_mul_v29(queue, gb_ptr, inter_ptr,
+                      chunks_ptr, num_chunks, IM);
+
+    // Down: [E, H, IM/2] weight, [E, H, IM/GS] scale
+    moe_down_forward_v29(queue, inter_ptr, w2_ptr, w2_s_ptr,
+                          out_ptr, chunks_ptr, num_chunks, IM, H);
+
+    return expert_output;
+}

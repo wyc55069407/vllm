@@ -145,6 +145,12 @@ TORCH_LIBRARY_FRAGMENT(vllm_kernel_custom, m) {
         "float input_norm_eps, float q_a_norm_eps, float kv_a_norm_eps, float bmm_w_scale) -> Tensor");
   m.impl("esimd_mla_mega", torch::kXPU, &esimd_mla_mega);
 
+  /* === Fused sigmoid+topk for MoE routing === */
+  m.def("esimd_moe_sigmoid_topk(Tensor logits, Tensor bias, "
+        "Tensor topk_weights, Tensor topk_ids, "
+        "int num_experts, int topk) -> ()");
+  m.impl("esimd_moe_sigmoid_topk", torch::kXPU, &esimd_moe_sigmoid_topk);
+
   /* === MoE decode fused ESIMD === */
   m.def("esimd_moe_decode(Tensor x, Tensor w13_qweight, Tensor w13_scales, "
         "Tensor w2_qweight, Tensor w2_scales, "
@@ -158,6 +164,13 @@ TORCH_LIBRARY_FRAGMENT(vllm_kernel_custom, m) {
         "Tensor topk_weights, Tensor topk_ids, "
         "Tensor output, int group_size) -> Tensor");
   m.impl("esimd_moe_decode_ts", torch::kXPU, &esimd_moe_decode_ts);
+
+  /* === MoE prefill master dispatch === */
+  m.def("esimd_moe_prefill(Tensor x, Tensor w13_qweight, Tensor w13_scales, "
+        "Tensor w13_scales_t, Tensor w2_qweight, Tensor w2_scales, "
+        "Tensor w2_scales_t, Tensor topk_weights, Tensor topk_ids, "
+        "Tensor output, int group_size) -> Tensor");
+  m.impl("esimd_moe_prefill", torch::kXPU, &esimd_moe_prefill);
 
   /* === oneDNN FP8 GEMM === */
   m.def("onednn_w8a16_fp8(Tensor x, Tensor weight, Tensor scales, "

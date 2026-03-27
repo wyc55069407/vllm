@@ -42,6 +42,8 @@ sources = [
     "csrc/xpu/uni_esimd_kernel.sycl",
     "csrc/xpu/onednn_fp8.sycl",
     "csrc/xpu/moe_decode.sycl",
+    "csrc/xpu/moe_prefill.sycl",
+    "csrc/xpu/moe_sigmoid_topk.sycl",
     "csrc/xpu/torch_extension_sycl.cc",
 ]
 
@@ -74,6 +76,7 @@ ext_modules.append(
 sources = [
     "csrc/xpu/uni_esimd_kernel_lgrf.sycl",
     "csrc/xpu/infllmv2_kernels_lgrf.sycl",
+    "csrc/xpu/moe_prefill_lgrf.sycl",
     "csrc/xpu/torch_extension_sycl_lgrf.cc",
 ]
 

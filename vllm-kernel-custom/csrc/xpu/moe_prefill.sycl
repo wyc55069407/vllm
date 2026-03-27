@@ -1,0 +1,201 @@
+// moe_prefill.sycl — Master dispatch for MoE prefill (standard GRF)
+// Build: common_ops extension
+// Pipeline: CPU routing → gather_states → {GGEMV(≤64) | oneDNN(>64)} → accumulate
+
+#include <ATen/core/dispatch/Dispatcher.h>
+#include <torch/all.h>
+#include <c10/xpu/XPUStream.h>
+#include "esimd_kernels/moe_prefill.h"
+#include <algorithm>
+#include <numeric>
+
+// CPU-side token routing — builds expert_offsets, expert_tokens, seq_to_token
+// Much simpler and works for any total_seqlen (no ESIMD alignment constraints)
+static void cpu_token_routing(
+    const int* topk_ids_ptr,  // [M, topk] on host
+    int* expert_offsets,      // [num_experts] on host
+    int* expert_tokens,       // [total_seqlen] on host
+    int* seq_to_token,        // [M * topk] on host (maps seq_idx → position in expert buffer)
+    int M, int topk, int num_experts)
+{
+    const int total_seqlen = M * topk;
+
+    // Count tokens per expert
+    std::vector<int> counts(num_experts, 0);
+    for (int i = 0; i < total_seqlen; i++)
+        counts[topk_ids_ptr[i]]++;
+
+    // Exclusive prefix sum → offsets
+    int sum = 0;
+    for (int e = 0; e < num_experts; e++) {
+        expert_offsets[e] = sum;
+        sum += counts[e];
+    }
+
+    // Scatter tokens to expert positions
+    std::vector<int> pos(num_experts);
+    for (int e = 0; e < num_experts; e++) pos[e] = expert_offsets[e];
+
+    for (int i = 0; i < total_seqlen; i++) {
+        int eid = topk_ids_ptr[i];
+        int p = pos[eid]++;
+        int tok = i / topk;  // original token index
+        expert_tokens[p] = tok;
+        seq_to_token[i] = p;
+    }
+}
+
+// Build chunk list for GGEMV experts (nt > 0 && nt <= MAX_M)
+static std::vector<int> build_chunk_list(
+    const int* expert_offsets, int num_experts, int total_seqlen, int max_m)
+{
+    std::vector<int> chunks;
+    for (int e = 0; e < num_experts; e++) {
+        int t0 = expert_offsets[e];
+        int t1 = (e + 1 < num_experts) ? expert_offsets[e + 1] : total_seqlen;
+        int nt = t1 - t0;
+        if (nt <= 0 || nt > max_m) continue;
+        chunks.push_back(e);
+        chunks.push_back(t0);
+        chunks.push_back(nt);
+    }
+    return chunks;
+}
+
+static bool has_large_experts(
+    const int* expert_offsets, int num_experts, int total_seqlen, int max_m)
+{
+    for (int e = 0; e < num_experts; e++) {
+        int t0 = expert_offsets[e];
+        int t1 = (e + 1 < num_experts) ? expert_offsets[e + 1] : total_seqlen;
+        if (t1 - t0 > max_m) return true;
+    }
+    return false;
+}
+
+static int max_expert_tokens(
+    const int* expert_offsets, int num_experts, int total_seqlen)
+{
+    int mx = 0;
+    for (int e = 0; e < num_experts; e++) {
+        int t0 = expert_offsets[e];
+        int t1 = (e + 1 < num_experts) ? expert_offsets[e + 1] : total_seqlen;
+        if (t1 - t0 > mx) mx = t1 - t0;
+    }
+    return mx;
+}
+
+// ======================== ATen entry point ========================
+at::Tensor esimd_moe_prefill(
+    at::Tensor x,               // [M, K] fp16
+    at::Tensor w13_qweight,     // [E, 2*N, K/2] uint8
+    at::Tensor w13_scales,      // [E, 2*N, K/GS] fp16 (non-transposed)
+    at::Tensor w13_scales_t,    // [E, K/GS, 2*N] fp16 (transposed, for oneDNN)
+    at::Tensor w2_qweight,      // [E, K, N/2] uint8
+    at::Tensor w2_scales,       // [E, K, N/GS] fp16 (non-transposed)
+    at::Tensor w2_scales_t,     // [E, N/GS, K] fp16 (transposed, for oneDNN)
+    at::Tensor topk_weights,    // [M, topk] float32
+    at::Tensor topk_ids,        // [M, topk] int32
+    at::Tensor output,          // [M, K] fp16
+    int64_t group_size)
+{
+    const int M = x.size(0);
+    const int K = x.size(1);
+    const int num_experts = w13_qweight.size(0);
+    const int N = w13_qweight.size(1) / 2;
+    const int topk = topk_ids.size(1);
+    const int total_seqlen = M * topk;
+    constexpr int MAX_M = 64;
+    const int BS = (int)group_size;
+
+    sycl::queue& queue = c10::xpu::getCurrentXPUStream(x.device().index()).queue();
+    auto dev = x.device();
+    auto opts_i32 = at::TensorOptions().device(dev).dtype(at::kInt);
+    auto opts_f16 = at::TensorOptions().device(dev).dtype(at::kHalf);
+
+    // Step 1: CPU token routing (works for any M*topk, no alignment constraints)
+    auto topk_ids_cpu = topk_ids.cpu().contiguous();
+    std::vector<int> h_expert_offsets(num_experts);
+    std::vector<int> h_expert_tokens(total_seqlen);
+    std::vector<int> h_seq_to_token(total_seqlen);
+    cpu_token_routing(topk_ids_cpu.data_ptr<int>(),
+                      h_expert_offsets.data(), h_expert_tokens.data(), h_seq_to_token.data(),
+                      M, topk, num_experts);
+
+    // Copy routing buffers to device
+    auto expert_tokens_dev = at::from_blob(h_expert_tokens.data(), {total_seqlen},
+                                            at::TensorOptions().dtype(at::kInt)).to(dev);
+    auto seq_to_token_dev = at::from_blob(h_seq_to_token.data(), {total_seqlen},
+                                           at::TensorOptions().dtype(at::kInt)).to(dev);
+
+    // Step 2: gather_states — scatter input to per-expert contiguous buffer
+    auto expert_states = at::empty({total_seqlen, K}, opts_f16);
+    moe_gather_states<fp16>(
+        queue,
+        reinterpret_cast<const fp16*>(x.data_ptr()),
+        expert_tokens_dev.data_ptr<int>(),
+        reinterpret_cast<fp16*>(expert_states.data_ptr()),
+        total_seqlen, K);
+
+    // Allocate intermediate buffers
+    auto gate_buf = at::empty({total_seqlen, 2 * N}, opts_f16);
+    auto intermediate_buf = at::empty({total_seqlen, N}, opts_f16);
+    auto expert_output = at::zeros({total_seqlen, K}, opts_f16);
+
+    // Step 3: GGEMV for small experts (nt <= MAX_M)
+    auto chunk_list = build_chunk_list(h_expert_offsets.data(), num_experts, total_seqlen, MAX_M);
+    int num_chunks = (int)chunk_list.size() / 3;
+
+    if (num_chunks > 0) {
+        auto chunks_tensor = at::from_blob(chunk_list.data(), {num_chunks, 3},
+                                            at::TensorOptions().dtype(at::kInt)).to(dev);
+
+        // Cross-extension call to LGRF GGEMV
+        static auto ggemv_op = c10::Dispatcher::singleton()
+            .findSchemaOrThrow("vllm_kernel_custom::esimd_moe_prefill_ggemv", "")
+            .typed<at::Tensor(at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+                              at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+                              int64_t, int64_t)>();
+
+        ggemv_op.call(expert_states, w13_qweight, w13_scales,
+                       w2_qweight, w2_scales,
+                       gate_buf, intermediate_buf, expert_output,
+                       chunks_tensor, (int64_t)K, (int64_t)N);
+    }
+    queue.wait();
+
+    // Step 4: oneDNN for large experts (nt > MAX_M)
+    // Cache only M=1..4096 — primitive overhead is negligible vs oneDNN compute time
+    constexpr int ONEDNN_MAX_CACHE_M = 4096;
+    if (has_large_experts(h_expert_offsets.data(), num_experts, total_seqlen, MAX_M)) {
+        std::lock_guard<std::mutex> lock(g_moe_prefill_dnn_mutex);
+        if (!g_moe_prefill_dnn_ctx.initialized) {
+            g_moe_prefill_dnn_ctx.init(queue, K, N, BS, ONEDNN_MAX_CACHE_M);
+        }
+
+        moe_onednn_forward<128, MAX_M>(
+            queue, g_moe_prefill_dnn_ctx,
+            reinterpret_cast<const fp16*>(expert_states.data_ptr()),
+            w13_qweight.data_ptr<uint8_t>(),
+            reinterpret_cast<const fp16*>(w13_scales_t.data_ptr()),
+            w2_qweight.data_ptr<uint8_t>(),
+            reinterpret_cast<const fp16*>(w2_scales_t.data_ptr()),
+            reinterpret_cast<fp16*>(intermediate_buf.data_ptr()),
+            reinterpret_cast<fp16*>(expert_output.data_ptr()),
+            reinterpret_cast<fp16*>(gate_buf.data_ptr()),
+            h_expert_offsets.data(), num_experts, total_seqlen, K, N);
+    }
+
+    // Step 5: accumulate — weighted sum
+    auto routing_weights_flat = topk_weights.contiguous();
+    moe_accumulate<fp16>(
+        queue,
+        reinterpret_cast<const fp16*>(expert_output.data_ptr()),
+        routing_weights_flat.data_ptr<float>(),
+        seq_to_token_dev.data_ptr<int>(),
+        reinterpret_cast<fp16*>(output.data_ptr()),
+        M, K, topk);
+    queue.wait();
+
+    return output;
+}

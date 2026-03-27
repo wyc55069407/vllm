@@ -111,6 +111,14 @@ TORCH_LIBRARY_FRAGMENT(vllm_kernel_custom, m) {
         "int start_pooled_block) -> Tensor");
   m.impl("esimd_infllmv2_k_pooling_paged", torch::kXPU, &esimd_infllmv2_k_pooling_paged);
 
+  /* === MoE prefill GGEMV (doubleGRF) === */
+  m.def("esimd_moe_prefill_ggemv(Tensor expert_states, "
+        "Tensor w13_qweight, Tensor w13_scales, "
+        "Tensor w2_qweight, Tensor w2_scales, "
+        "Tensor gate_buf, Tensor intermediate, Tensor expert_output, "
+        "Tensor chunks, int hidden_size, int intermediate_size) -> Tensor");
+  m.impl("esimd_moe_prefill_ggemv", torch::kXPU, &esimd_moe_prefill_ggemv);
+
   /* === InfLLMv2 Force Last Block === */
   m.def("esimd_infllmv2_force_last_block(Tensor sparse_mask, Tensor seq_lens, "
         "int num_kv_heads, int sparse_block_size) -> Tensor");

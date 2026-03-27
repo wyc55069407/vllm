@@ -211,6 +211,29 @@ at::Tensor esimd_moe_decode_ts(
     at::Tensor topk_weights, at::Tensor topk_ids,
     at::Tensor output, int64_t group_size);
 
+/* ========== Fused sigmoid+topk for MoE routing ========== */
+
+void esimd_moe_sigmoid_topk(
+    at::Tensor logits, at::Tensor bias,
+    at::Tensor topk_weights, at::Tensor topk_ids,
+    int64_t num_experts, int64_t topk);
+
+/* ========== MoE prefill ops ========== */
+
+// MoE prefill master dispatch (common_ops, standard GRF)
+at::Tensor esimd_moe_prefill(
+    at::Tensor x, at::Tensor w13_qweight, at::Tensor w13_scales,
+    at::Tensor w13_scales_t, at::Tensor w2_qweight, at::Tensor w2_scales,
+    at::Tensor w2_scales_t, at::Tensor topk_weights, at::Tensor topk_ids,
+    at::Tensor output, int64_t group_size);
+
+// MoE prefill GGEMV sub-op (common_ops_lgrf, doubleGRF)
+at::Tensor esimd_moe_prefill_ggemv(
+    at::Tensor expert_states, at::Tensor w13_qweight, at::Tensor w13_scales,
+    at::Tensor w2_qweight, at::Tensor w2_scales,
+    at::Tensor gate_buf, at::Tensor intermediate, at::Tensor expert_output,
+    at::Tensor chunks, int64_t hidden_size, int64_t intermediate_size);
+
 /* ========== oneDNN ops (common_ops) ========== */
 
 // oneDNN FP8 GEMM: FP16/BF16 x FP8_E4M3, per-N scale

@@ -14,13 +14,17 @@ import time
 import typing
 from collections.abc import Callable, Iterable
 
-# ESIMD MoE decode kernel (optional, enabled by MINICPM5_ESIMD_MOE=1)
+# ESIMD MoE kernels (optional, enabled by MINICPM5_ESIMD_MOE=1)
 _esimd_moe_decode = None
 _esimd_moe_decode_ts = None
+_esimd_moe_prefill = None
+_esimd_moe_sigmoid_topk = None
 if os.environ.get("MINICPM5_ESIMD_MOE", "0") == "1":
     try:
         from vllm_kernel_custom.esimd_ops import esimd_moe_decode as _esimd_moe_decode
         from vllm_kernel_custom.esimd_ops import esimd_moe_decode_ts as _esimd_moe_decode_ts
+        from vllm_kernel_custom.esimd_ops import esimd_moe_prefill as _esimd_moe_prefill
+        from vllm_kernel_custom.esimd_ops import esimd_moe_sigmoid_topk as _esimd_moe_sigmoid_topk
     except ImportError:
         pass
 
@@ -345,22 +349,49 @@ class MiniCPM5MoEMoE(nn.Module):
             list(self._w2_scales_t.shape),
         )
 
+    def _esimd_routing(
+        self, router_logits: torch.Tensor, num_tokens: int
+    ) -> tuple:
+        """Fused sigmoid+topk routing or PyTorch fallback."""
+        topk = self.experts.moe_config.experts_per_token
+        num_experts = router_logits.size(-1)
+
+        if (_esimd_moe_sigmoid_topk is not None
+                and num_experts == 160 and topk == 16):
+            # Fused ESIMD: sigmoid + bias + topk + renorm in one kernel
+            bias = (self.gate.e_score_correction_bias.float()
+                    if self.gate.e_score_correction_bias is not None
+                    else torch.empty(0, dtype=torch.float32,
+                                     device=router_logits.device))
+            topk_weights = torch.empty(num_tokens, topk,
+                                       dtype=torch.float32,
+                                       device=router_logits.device)
+            topk_ids = torch.empty(num_tokens, topk,
+                                   dtype=torch.int32,
+                                   device=router_logits.device)
+            _esimd_moe_sigmoid_topk(
+                router_logits.half(), bias,
+                topk_weights, topk_ids,
+                num_experts, topk)
+        else:
+            # PyTorch fallback
+            scores = torch.sigmoid(router_logits.float())
+            if self.gate.e_score_correction_bias is not None:
+                scores = scores + self.gate.e_score_correction_bias.unsqueeze(0)
+            topk_weights, topk_ids = torch.topk(scores, k=topk, dim=-1)
+            topk_ids = topk_ids.to(torch.int32)
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+            topk_weights = topk_weights.to(torch.float32)
+
+        return topk_weights, topk_ids
+
     def _esimd_forward(
         self, hidden_states: torch.Tensor, num_tokens: int, hidden_dim: int
     ) -> torch.Tensor:
         """ESIMD MoE decode fast path: routing + ESIMD kernel + shared expert."""
-        # 1. Routing: gate → sigmoid → correction bias → topk → renorm
+        # 1. Routing: fused sigmoid+topk or PyTorch fallback
         router_logits, _ = self.gate(hidden_states)
-        scores = torch.sigmoid(router_logits.float())
-        if self.gate.e_score_correction_bias is not None:
-            scores = scores + self.gate.e_score_correction_bias.unsqueeze(0)
-
-        topk = self.experts.moe_config.experts_per_token
-        topk_weights, topk_ids = torch.topk(scores, k=topk, dim=-1)
-        topk_ids = topk_ids.to(torch.int32)
-        # Renormalize weights (norm_topk_prob=True)
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-        topk_weights = topk_weights.to(torch.float32)
+        topk_weights, topk_ids = self._esimd_routing(router_logits, num_tokens)
 
         # 2. ESIMD MoE decode kernel (routed experts)
         group_size = self.experts.group_size
@@ -422,9 +453,74 @@ class MiniCPM5MoEMoE(nn.Module):
             MiniCPM5MoEMoE._esimd_logged = True
             logger.warning(
                 "ESIMD MoE decode: M=%d, K=%d, topk=%d, group_size=%d, "
-                "transposed_scales=%s",
-                num_tokens, hidden_dim, topk, group_size,
+                "transposed_scales=%s, fused_topk=%s",
+                num_tokens, hidden_dim,
+                self.experts.moe_config.experts_per_token, group_size,
                 _esimd_moe_decode_ts is not None,
+                _esimd_moe_sigmoid_topk is not None,
+            )
+
+        return final_hidden_states.view(num_tokens, hidden_dim)
+
+    _esimd_prefill_logged = False
+
+    def _esimd_prefill_forward(
+        self, hidden_states: torch.Tensor, num_tokens: int, hidden_dim: int
+    ) -> torch.Tensor:
+        """ESIMD MoE prefill fast path: routing + ESIMD GGEMV/oneDNN + shared expert."""
+        # 1. Routing: fused sigmoid+topk or PyTorch fallback
+        router_logits, _ = self.gate(hidden_states)
+        topk_weights, topk_ids = self._esimd_routing(router_logits, num_tokens)
+
+        # 2. ESIMD MoE prefill kernel
+        group_size = self.experts.group_size
+        output = torch.zeros_like(hidden_states)
+
+        # Need both non-transposed (GGEMV) and transposed (oneDNN) scales
+        self._ensure_transposed_scales()
+        w13_scales = self.experts.w13_scales
+        w2_scales = self.experts.w2_scales
+        w13_scales_t = self._w13_scales_t
+        w2_scales_t = self._w2_scales_t
+
+        # Ensure dtype match
+        if w13_scales.dtype != hidden_states.dtype:
+            w13_scales = w13_scales.to(hidden_states.dtype)
+            w2_scales = w2_scales.to(hidden_states.dtype)
+            w13_scales_t = w13_scales_t.to(hidden_states.dtype)
+            w2_scales_t = w2_scales_t.to(hidden_states.dtype)
+
+        _esimd_moe_prefill(
+            hidden_states,
+            self.experts.w13_qweight, w13_scales, w13_scales_t,
+            self.experts.w2_qweight, w2_scales, w2_scales_t,
+            topk_weights, topk_ids,
+            output, group_size,
+        )
+
+        final_hidden_states = output
+
+        # 3. Shared expert
+        shared_output = None
+        if self.shared_experts is not None:
+            shared_output = self.shared_experts(hidden_states)
+
+        # 4. Apply routed_scaling_factor
+        if hidden_states.dtype != torch.float16:
+            final_hidden_states = final_hidden_states * self.routed_scaling_factor
+        elif shared_output is not None:
+            shared_output = shared_output * (1.0 / self.routed_scaling_factor)
+
+        # 5. Add shared expert output
+        if shared_output is not None:
+            final_hidden_states = final_hidden_states + shared_output
+
+        if not MiniCPM5MoEMoE._esimd_prefill_logged:
+            MiniCPM5MoEMoE._esimd_prefill_logged = True
+            logger.warning(
+                "ESIMD MoE prefill: M=%d, K=%d, topk=%d, group_size=%d",
+                num_tokens, hidden_dim,
+                self.experts.moe_config.experts_per_token, group_size,
             )
 
         return final_hidden_states.view(num_tokens, hidden_dim)
@@ -435,6 +531,17 @@ class MiniCPM5MoEMoE(nn.Module):
 
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
+
+        # === ESIMD MoE prefill fast path (M > 64) ===
+        # Needs M*topk large enough for GGEMV efficiency; short prompts use Triton
+        if (
+            _esimd_moe_prefill is not None
+            and num_tokens > 64
+            and not self.is_sequence_parallel
+            and self.tp_size == 1
+        ):
+            return self._esimd_prefill_forward(
+                hidden_states, num_tokens, hidden_dim)
 
         # === ESIMD MoE decode fast path (M <= 8) ===
         if (
