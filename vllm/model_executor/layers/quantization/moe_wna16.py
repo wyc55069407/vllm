@@ -389,6 +389,31 @@ class MoeWNA16Method(FusedMoEMethodBase):
             quant_config=self.moe_quant_config,
         )
 
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        """Bulk-copy CPU-staged MoE weights to device.
+
+        During weight loading, per-expert weights are accumulated into
+        CPU staging buffers to avoid 24K+ tiny CPU→device transfers.
+        This method copies each staging buffer to the device parameter
+        in one bulk transfer, then removes the staging buffers.
+        """
+        staging = getattr(layer, '_moe_cpu_staging', None)
+        if not staging:
+            return
+        import logging
+        logger = logging.getLogger(__name__)
+        import time
+        t0 = time.perf_counter()
+        for param_name, cpu_buf in staging.items():
+            param = getattr(layer, param_name, None)
+            if param is not None:
+                param.data.copy_(cpu_buf)
+        t1 = time.perf_counter()
+        n = len(staging)
+        del layer._moe_cpu_staging
+        logger.info(
+            "MoE bulk weight transfer: %d params, %.1f s", n, t1 - t0)
+
     @staticmethod
     def get_weight_loader(layer, weight_loader):
         def convert_awq_tensor(tensor, tensor_type):
@@ -437,6 +462,23 @@ class MoeWNA16Method(FusedMoEMethodBase):
             tensor = tensor[:, :, 0] + tensor[:, :, 1] * 16
             return tensor
 
+        def _get_cpu_staging(param_name, param):
+            """Get or create a CPU staging buffer mirroring the param."""
+            if not hasattr(layer, '_moe_cpu_staging'):
+                layer._moe_cpu_staging = {}
+            staging = layer._moe_cpu_staging
+            if param_name not in staging:
+                staging[param_name] = torch.zeros_like(
+                    param.data, device='cpu')
+            return staging[param_name]
+
+        def _find_param_name(param):
+            """Find the parameter name on the layer for staging lookup."""
+            for name, p in layer.named_parameters():
+                if p.data_ptr() == param.data_ptr():
+                    return name
+            return None
+
         def moe_wna16_weight_loader(
             param: torch.nn.Parameter,
             loaded_weight: torch.Tensor,
@@ -450,10 +492,15 @@ class MoeWNA16Method(FusedMoEMethodBase):
             if not layer.quant_config.has_zp and "qzeros" in weight_name:
                 return False if return_success else None
 
-            device = get_tp_group().device
             tp_rank = get_tensor_model_parallel_rank()
-            loaded_weight = loaded_weight.to(device)
             shard_size = layer.intermediate_size_per_partition
+
+            # Keep weight on CPU for transforms. All operations below
+            # (.T, .contiguous, .view) are cheap on CPU. We accumulate
+            # into a CPU staging buffer and do one bulk transfer to
+            # device in process_weights_after_loading().
+            if loaded_weight.device.type != 'cpu':
+                loaded_weight = loaded_weight.cpu()
 
             # convert gptq and awq weight to a standard format
             # awq_marlin uses the same weight format as awq
@@ -489,29 +536,68 @@ class MoeWNA16Method(FusedMoEMethodBase):
                     layer.group_size_div_factor, 1
                 )
 
-            if "w13_qzeros" in weight_name:
-                tensor = loaded_weight.view(layer.tp_size, -1, loaded_weight.size(1))[
-                    tp_rank
-                ]
-                if shard_id == "w1":
-                    param.data[expert_id, : shard_size // 2] = tensor
+            # Write to CPU staging buffer instead of device param
+            param_name = _find_param_name(param)
+            if param_name is not None:
+                cpu_buf = _get_cpu_staging(param_name, param)
+
+                if "w13_qzeros" in weight_name:
+                    tensor = loaded_weight.view(
+                        layer.tp_size, -1, loaded_weight.size(1)
+                    )[tp_rank]
+                    if shard_id == "w1":
+                        cpu_buf[expert_id, : shard_size // 2] = tensor
+                    else:
+                        cpu_buf[expert_id, shard_size // 2 :] = tensor
+                    return True if return_success else None
+                elif "w2_qzeros" in weight_name:
+                    cpu_buf[expert_id] = loaded_weight.view(
+                        loaded_weight.size(0), layer.tp_size, -1
+                    )[:, tp_rank]
+                    return True if return_success else None
                 else:
-                    param.data[expert_id, shard_size // 2 :] = tensor
-                return True if return_success else None
-            elif "w2_qzeros" in weight_name:
-                param.data[expert_id] = loaded_weight.view(
-                    loaded_weight.size(0), layer.tp_size, -1
-                )[:, tp_rank]
-                return True if return_success else None
+                    # Use a temporary CPU param for the base weight_loader
+                    cpu_param = torch.nn.Parameter(
+                        cpu_buf, requires_grad=False)
+                    # Copy weight_attrs from original param
+                    for attr in ('is_transposed', 'quant_method',
+                                 'is_gguf_weight', 'is_gguf_weight_type'):
+                        if hasattr(param, attr):
+                            setattr(cpu_param, attr, getattr(param, attr))
+                    return weight_loader(
+                        cpu_param,
+                        loaded_weight,
+                        weight_name,
+                        shard_id,
+                        expert_id,
+                        return_success=return_success,
+                    )
             else:
-                # Delegate to the original loader, passing return_success
-                return weight_loader(
-                    param,
-                    loaded_weight,
-                    weight_name,
-                    shard_id,
-                    expert_id,
-                    return_success=return_success,
-                )
+                # Fallback: direct device transfer (shouldn't happen)
+                device = get_tp_group().device
+                loaded_weight = loaded_weight.to(device)
+                if "w13_qzeros" in weight_name:
+                    tensor = loaded_weight.view(
+                        layer.tp_size, -1, loaded_weight.size(1)
+                    )[tp_rank]
+                    if shard_id == "w1":
+                        param.data[expert_id, : shard_size // 2] = tensor
+                    else:
+                        param.data[expert_id, shard_size // 2 :] = tensor
+                    return True if return_success else None
+                elif "w2_qzeros" in weight_name:
+                    param.data[expert_id] = loaded_weight.view(
+                        loaded_weight.size(0), layer.tp_size, -1
+                    )[:, tp_rank]
+                    return True if return_success else None
+                else:
+                    return weight_loader(
+                        param,
+                        loaded_weight,
+                        weight_name,
+                        shard_id,
+                        expert_id,
+                        return_success=return_success,
+                    )
 
         return moe_wna16_weight_loader

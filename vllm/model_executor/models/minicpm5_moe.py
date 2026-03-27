@@ -472,9 +472,16 @@ class MiniCPM5MoEMoE(nn.Module):
         router_logits, _ = self.gate(hidden_states)
         topk_weights, topk_ids = self._esimd_routing(router_logits, num_tokens)
 
-        # 2. ESIMD MoE prefill kernel
+        # 2. ESIMD MoE prefill kernel (requires fp16 — kernel is hardcoded sycl::half)
         group_size = self.experts.group_size
-        output = torch.zeros_like(hidden_states)
+        orig_dtype = hidden_states.dtype
+        need_fp16_convert = (orig_dtype != torch.float16)
+
+        if need_fp16_convert:
+            hidden_states_fp16 = hidden_states.to(torch.float16)
+        else:
+            hidden_states_fp16 = hidden_states
+        output = torch.zeros_like(hidden_states_fp16)
 
         # Need both non-transposed (GGEMV) and transposed (oneDNN) scales
         self._ensure_transposed_scales()
@@ -483,20 +490,23 @@ class MiniCPM5MoEMoE(nn.Module):
         w13_scales_t = self._w13_scales_t
         w2_scales_t = self._w2_scales_t
 
-        # Ensure dtype match
-        if w13_scales.dtype != hidden_states.dtype:
-            w13_scales = w13_scales.to(hidden_states.dtype)
-            w2_scales = w2_scales.to(hidden_states.dtype)
-            w13_scales_t = w13_scales_t.to(hidden_states.dtype)
-            w2_scales_t = w2_scales_t.to(hidden_states.dtype)
+        # Scales must be fp16 to match kernel expectation
+        if w13_scales.dtype != torch.float16:
+            w13_scales = w13_scales.to(torch.float16)
+            w2_scales = w2_scales.to(torch.float16)
+            w13_scales_t = w13_scales_t.to(torch.float16)
+            w2_scales_t = w2_scales_t.to(torch.float16)
 
         _esimd_moe_prefill(
-            hidden_states,
+            hidden_states_fp16,
             self.experts.w13_qweight, w13_scales, w13_scales_t,
             self.experts.w2_qweight, w2_scales, w2_scales_t,
             topk_weights, topk_ids,
             output, group_size,
         )
+
+        if need_fp16_convert:
+            output = output.to(orig_dtype)
 
         final_hidden_states = output
 
