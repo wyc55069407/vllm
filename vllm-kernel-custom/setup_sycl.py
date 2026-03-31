@@ -44,6 +44,7 @@ sources = [
     "csrc/xpu/moe_decode.sycl",
     "csrc/xpu/moe_prefill.sycl",
     "csrc/xpu/moe_sigmoid_topk.sycl",
+    "csrc/xpu/w4a16_gemv.sycl",
     "csrc/xpu/torch_extension_sycl.cc",
 ]
 

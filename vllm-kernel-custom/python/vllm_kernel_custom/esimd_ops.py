@@ -343,6 +343,44 @@ def esimd_moe_sigmoid_topk(
 
 
 # ============================================================
+# W4A16 ESIMD GEMV (non-MoE, common_ops)
+# ============================================================
+
+def esimd_w4a16_gemv(
+    x: torch.Tensor, weight: torch.Tensor, scales: torch.Tensor,
+    output: torch.Tensor, group_size: int,
+) -> torch.Tensor:
+    """General W4A16 GEMV: y[M,N] = dequant(W[N,K/2]) @ x[M,K].
+
+    Args:
+        x:       [M, K]     bf16/fp16  — input activations (M=1..8)
+        weight:  [N, K/2]   uint8      — packed u4 weights (oneDNN layout)
+        scales:  [N, K/GS]  bf16/fp16  — per-row contiguous scales
+        output:  [M, N]     bf16/fp16  — pre-allocated output
+        group_size: 32, 64, or 128
+    """
+    return _ops.esimd_w4a16_gemv(x, weight, scales, output, group_size)
+
+
+def esimd_w4a16_gate_up_silu(
+    x: torch.Tensor, weight: torch.Tensor, scales: torch.Tensor,
+    output: torch.Tensor, N_half: int, group_size: int,
+) -> torch.Tensor:
+    """Fused gate+up+SiLU: y[M,N] = SiLU(W_gate @ x) * (W_up @ x).
+
+    Args:
+        x:       [M, K]       bf16/fp16
+        weight:  [2*N, K/2]   uint8     — first N rows=gate, next N=up
+        scales:  [2*N, K/GS]  bf16/fp16
+        output:  [M, N]       bf16/fp16
+        N_half:  int          — N (half of weight rows)
+        group_size: 32, 64, or 128
+    """
+    return _ops.esimd_w4a16_gate_up_silu(
+        x, weight, scales, output, N_half, group_size)
+
+
+# ============================================================
 # MoE decode ESIMD ops (common_ops)
 # ============================================================
 

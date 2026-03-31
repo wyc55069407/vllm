@@ -211,6 +211,19 @@ at::Tensor esimd_moe_decode_ts(
     at::Tensor topk_weights, at::Tensor topk_ids,
     at::Tensor output, int64_t group_size);
 
+/* ========== W4A16 ESIMD GEMV (non-MoE, common_ops) ========== */
+
+// General W4A16 GEMV: y[M,N] = dequant(W[N,K/2]) @ x[M,K]
+at::Tensor esimd_w4a16_gemv(
+    at::Tensor x, at::Tensor weight, at::Tensor scales,
+    at::Tensor output, int64_t group_size);
+
+// Fused gate+up+SiLU: y[M,N] = SiLU(W_gate @ x) * (W_up @ x)
+// weight [2*N, K/2], scales [2*N, K/GS]
+at::Tensor esimd_w4a16_gate_up_silu(
+    at::Tensor x, at::Tensor weight, at::Tensor scales,
+    at::Tensor output, int64_t N_half, int64_t group_size);
+
 /* ========== Fused sigmoid+topk for MoE routing ========== */
 
 void esimd_moe_sigmoid_topk(

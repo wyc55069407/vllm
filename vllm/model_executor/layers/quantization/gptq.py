@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import enum
+import os
 from enum import Enum
 from fractions import Fraction
 from typing import TYPE_CHECKING, Any, Union
@@ -451,6 +452,12 @@ class GPTQLinearMethod(LinearMethodBase):
         layer.onednn_N = N
         layer.onednn_group_size = group_size
 
+        # ESIMD GEMV: pre-transpose scales to [N, K/GS] in bf16/fp16
+        # (contiguous per-row for dequant_dot pattern)
+        scales_t = scales_fp32.t().contiguous()  # [N, num_groups]
+        layer.esimd_scales_fp16 = scales_t.to(torch.float16)
+        layer.esimd_scales_bf16 = scales_t.to(torch.bfloat16)
+
         logger.info(
             "GPTQ layer converted to oneDNN u4: "
             "weight [%d, %d] u4, scales [%d, %d] fp32, "
@@ -515,6 +522,25 @@ class GPTQLinearMethod(LinearMethodBase):
 
         return w_deq.t().contiguous()  # [N, K]
 
+    @staticmethod
+    def _onednn_gemm(reshaped_x, layer, M, N, K, output):
+        """oneDNN W4A16 INT4 GEMM dispatch."""
+        dummy_bias = torch.empty(
+            0, dtype=reshaped_x.dtype, device=reshaped_x.device)
+        torch.ops.vllm_kernel_custom.onednn_w4a16_int4(
+            reshaped_x.contiguous(),
+            layer.onednn_weight,
+            layer.onednn_scales,
+            layer.onednn_zp,
+            dummy_bias,
+            output,
+            M, N, K,
+            layer.onednn_group_size,
+            1,  # has_zp
+            0,  # has_bias
+        )
+        return output
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -528,7 +554,6 @@ class GPTQLinearMethod(LinearMethodBase):
 
         if current_platform.is_xpu() and self.quant_config.weight_bits == 4:
             if hasattr(layer, 'onednn_weight'):
-                # Native oneDNN INT4 GEMM via vllm-kernel-custom
                 M = reshaped_x.shape[0]
                 K = layer.onednn_K
                 N = layer.onednn_N
@@ -536,22 +561,44 @@ class GPTQLinearMethod(LinearMethodBase):
                     M, N, dtype=reshaped_x.dtype,
                     device=reshaped_x.device,
                 )
-                dummy_bias = torch.empty(
-                    0, dtype=reshaped_x.dtype,
-                    device=reshaped_x.device,
-                )
-                torch.ops.vllm_kernel_custom.onednn_w4a16_int4(
-                    reshaped_x.contiguous(),
-                    layer.onednn_weight,
-                    layer.onednn_scales,
-                    layer.onednn_zp,
-                    dummy_bias,
-                    output,
-                    M, N, K,
-                    layer.onednn_group_size,
-                    1,  # has_zp
-                    0,  # has_bias
-                )
+
+                # ESIMD GEMV fast path for decode (M<=8)
+                if (M <= 8
+                    and os.environ.get("MINICPM5_ESIMD_GEMV", "0") == "1"
+                    and hasattr(layer, 'esimd_scales_fp16')):
+                    try:
+                        esimd_scales = (
+                            layer.esimd_scales_bf16
+                            if reshaped_x.dtype == torch.bfloat16
+                            else layer.esimd_scales_fp16
+                        )
+                        torch.ops.vllm_kernel_custom.esimd_w4a16_gemv(
+                            reshaped_x.contiguous(),
+                            layer.onednn_weight,
+                            esimd_scales,
+                            output,
+                            layer.onednn_group_size,
+                        )
+                        if not getattr(GPTQLinearMethod,
+                                       '_esimd_gemv_logged', False):
+                            GPTQLinearMethod._esimd_gemv_logged = True
+                            import logging
+                            logging.getLogger(__name__).warning(
+                                "ESIMD W4A16 GEMV active: M=%d, N=%d, K=%d",
+                                M, N, K)
+                    except Exception as e:
+                        # Fall through to oneDNN on any error
+                        if not getattr(GPTQLinearMethod,
+                                       '_esimd_gemv_err_logged', False):
+                            GPTQLinearMethod._esimd_gemv_err_logged = True
+                            import logging
+                            logging.getLogger(__name__).warning(
+                                "ESIMD GEMV fallback to oneDNN: %s", e)
+                        output = self._onednn_gemm(
+                            reshaped_x, layer, M, N, K, output)
+                else:
+                    output = self._onednn_gemm(
+                        reshaped_x, layer, M, N, K, output)
             else:
                 # Fallback: dequantize + F.linear (desc_act=true or no
                 # vllm-kernel-custom)

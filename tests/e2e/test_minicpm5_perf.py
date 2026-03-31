@@ -20,6 +20,7 @@ import os, time, json
 os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 os.environ.setdefault("MINICPM5_ESIMD_MOE", "1")
+os.environ.setdefault("MINICPM5_ESIMD_GEMV", "1")
 
 MODEL_PATH = "/home/sas/yuchen/vllm_env/models/minicpm5.16a3.v0314-GPTQ-Int4"
 CORPUS_PATH = os.path.join(os.path.dirname(__file__), "wiki_corpus.json")

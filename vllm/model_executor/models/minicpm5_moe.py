@@ -28,6 +28,21 @@ if os.environ.get("MINICPM5_ESIMD_MOE", "0") == "1":
     except ImportError:
         pass
 
+# ESIMD GEMV kernels for shared expert (enabled by MINICPM5_ESIMD_GEMV=1)
+_esimd_w4a16_gemv = None
+_esimd_w4a16_gate_up_silu = None
+_esimd_rope_available = False
+if os.environ.get("MINICPM5_ESIMD_GEMV", "0") == "1":
+    try:
+        from vllm_kernel_custom.esimd_ops import esimd_w4a16_gemv as _esimd_w4a16_gemv
+        from vllm_kernel_custom.esimd_ops import esimd_w4a16_gate_up_silu as _esimd_w4a16_gate_up_silu
+        # esimd_rope is available once vllm_kernel_custom is loaded
+        import torch as _torch
+        _torch.ops.vllm_kernel_custom.esimd_rope
+        _esimd_rope_available = True
+    except (ImportError, AttributeError):
+        pass
+
 import torch
 from torch import nn
 
@@ -170,7 +185,42 @@ class MiniCPM5MoEAttention(nn.Module):
                 [self.q_size, self.kv_size, self.kv_size], dim=-1
             )
 
-        q, k = self.rotary_emb(positions, q, k)
+        num_tokens = q.shape[0]
+        if (
+            _esimd_rope_available
+            and num_tokens <= 8
+            and self.head_dim in (64, 128)
+        ):
+            # ESIMD fused neox-style RoPE: 1 kernel instead of 8 elementwise
+            rotary_emb = self.rotary_emb
+            # Get cos_sin_cache (Phi3LongRoPE uses long_short_cos_sin_cache)
+            if hasattr(rotary_emb, 'long_short_cos_sin_cache'):
+                cos_sin_cache = rotary_emb.long_short_cos_sin_cache
+                # Compute effective positions for long rope
+                if getattr(rotary_emb, 'use_long_rope', False):
+                    eff_positions = positions + rotary_emb.original_max_position_embeddings
+                else:
+                    eff_positions = positions
+            else:
+                cos_sin_cache = rotary_emb.cos_sin_cache
+                eff_positions = positions
+            cos_sin_cache = cos_sin_cache.to(q.dtype)
+            # flag=2 means neox style, no offset
+            hd = self.head_dim
+            torch.ops.vllm_kernel_custom.esimd_rope(
+                q, k, cos_sin_cache,
+                eff_positions, eff_positions,  # positions_k unused (no offset)
+                self.num_heads, hd, hd,        # q_heads, rope_dim, q_stride
+                self.num_kv_heads, hd, hd,     # kv_heads, k_rope_dim, k_stride
+                self.num_kv_heads * hd,         # k_nope_stride (stride between seq pos in K)
+                num_tokens, 2,                  # seq_len, flag=2 (neox, no offset)
+            )
+            if not getattr(MiniCPM5MoEAttention, '_esimd_rope_logged', False):
+                MiniCPM5MoEAttention._esimd_rope_logged = True
+                logger.warning("ESIMD neox RoPE active: M=%d, heads=%d, hd=%d",
+                               num_tokens, self.num_heads, hd)
+        else:
+            q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
 
         if self.use_gated_attention:
@@ -384,6 +434,53 @@ class MiniCPM5MoEMoE(nn.Module):
 
         return topk_weights, topk_ids
 
+    def _esimd_shared_expert(
+        self, hidden_states: torch.Tensor, num_tokens: int
+    ) -> torch.Tensor:
+        """Shared expert: ESIMD fused gate_up_silu + GEMV down, or fallback."""
+        if (
+            _esimd_w4a16_gate_up_silu is not None
+            and _esimd_w4a16_gemv is not None
+            and num_tokens <= 8
+            and hasattr(self.shared_experts.gate_up_proj, 'linear_weights')
+        ):
+            try:
+                gate_up_lw = self.shared_experts.gate_up_proj.linear_weights
+                down_lw = self.shared_experts.down_proj.linear_weights
+                # Check if ESIMD scales exist (set by gptq.py)
+                if not hasattr(gate_up_lw, 'esimd_scales_fp16'):
+                    return self.shared_experts(hidden_states)
+
+                dtype = hidden_states.dtype
+                device = hidden_states.device
+                gs = gate_up_lw.onednn_group_size
+
+                # gate_up: [M, K] -> [M, N_half]
+                gu_w = gate_up_lw.onednn_weight      # [2*N, K/2]
+                gu_s = (gate_up_lw.esimd_scales_bf16
+                        if dtype == torch.bfloat16
+                        else gate_up_lw.esimd_scales_fp16)
+                N_half = gu_w.size(0) // 2
+                intermediate = torch.empty(
+                    num_tokens, N_half, dtype=dtype, device=device)
+                _esimd_w4a16_gate_up_silu(
+                    hidden_states, gu_w, gu_s, intermediate, N_half, gs)
+
+                # down: [M, N_half] -> [M, K]
+                dn_w = down_lw.onednn_weight          # [K, N_half/2]
+                dn_s = (down_lw.esimd_scales_bf16
+                        if dtype == torch.bfloat16
+                        else down_lw.esimd_scales_fp16)
+                K_out = dn_w.size(0)
+                shared_output = torch.empty(
+                    num_tokens, K_out, dtype=dtype, device=device)
+                _esimd_w4a16_gemv(
+                    intermediate, dn_w, dn_s, shared_output, gs)
+                return shared_output
+            except Exception:
+                pass
+        return self.shared_experts(hidden_states)
+
     def _esimd_forward(
         self, hidden_states: torch.Tensor, num_tokens: int, hidden_dim: int
     ) -> torch.Tensor:
@@ -433,10 +530,11 @@ class MiniCPM5MoEMoE(nn.Module):
 
         final_hidden_states = output
 
-        # 3. Shared expert
+        # 3. Shared expert (ESIMD fused or PyTorch fallback)
         shared_output = None
         if self.shared_experts is not None:
-            shared_output = self.shared_experts(hidden_states)
+            shared_output = self._esimd_shared_expert(
+                hidden_states, num_tokens)
 
         # 4. Apply routed_scaling_factor (vendor: always scale routed output)
         final_hidden_states = final_hidden_states * self.routed_scaling_factor
@@ -507,9 +605,7 @@ class MiniCPM5MoEMoE(nn.Module):
         final_hidden_states = output
 
         # 3. Shared expert
-        shared_output = None
-        if self.shared_experts is not None:
-            shared_output = self.shared_experts(hidden_states)
+        shared_output = self._esimd_shared_expert(hidden_states, num_tokens)
 
         # 4. Apply routed_scaling_factor (vendor: always scale routed output)
         final_hidden_states = final_hidden_states * self.routed_scaling_factor
