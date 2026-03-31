@@ -160,6 +160,9 @@ TORCH_LIBRARY_FRAGMENT(vllm_kernel_custom, m) {
         "Tensor output, int N_half, int group_size) -> Tensor");
   m.impl("esimd_w4a16_gate_up_silu", torch::kXPU, &esimd_w4a16_gate_up_silu);
 
+  m.def("esimd_fp16_gemv(Tensor x, Tensor weight, Tensor output) -> Tensor");
+  m.impl("esimd_fp16_gemv", torch::kXPU, &esimd_fp16_gemv);
+
   /* === MoE decode fused ESIMD === */
   m.def("esimd_moe_decode(Tensor x, Tensor w13_qweight, Tensor w13_scales, "
         "Tensor w2_qweight, Tensor w2_scales, "

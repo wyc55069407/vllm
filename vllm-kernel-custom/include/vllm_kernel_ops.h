@@ -224,6 +224,10 @@ at::Tensor esimd_w4a16_gate_up_silu(
     at::Tensor x, at::Tensor weight, at::Tensor scales,
     at::Tensor output, int64_t N_half, int64_t group_size);
 
+// FP16/BF16 GEMV: y[M,N] = weight[N,K] @ x[M,K]^T (unquantized)
+at::Tensor esimd_fp16_gemv(
+    at::Tensor x, at::Tensor weight, at::Tensor output);
+
 /* ========== Fused sigmoid+topk for MoE routing ========== */
 
 void esimd_moe_sigmoid_topk(

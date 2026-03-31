@@ -14,6 +14,7 @@
 #include <sycl/ext/intel/esimd.hpp>
 
 #include "esimd_kernels/w4a16_gemv.h"
+#include "esimd_kernels/fp16_gemv.h"
 
 using fp16 = sycl::half;
 using bf16 = sycl::ext::oneapi::bfloat16;
@@ -221,6 +222,76 @@ at::Tensor esimd_w4a16_gate_up_silu(
     #undef DISPATCH_GUS_DTYPE
     #undef DISPATCH_GUS_GS
     #undef LAUNCH_GUS
+
+    return output;
+}
+
+
+/* ─── FP16/BF16 GEMV dispatch ──────────────────────────────────────────────
+ *
+ * For unquantized linear layers (lm_head, MoE gate).
+ * y[M, N] = weight[N, K] @ x[M, K]^T
+ *
+ * K-split with SLM reduction, GROUP_SIZE=4 threads per output row.
+ */
+constexpr int FP16_GEMV_GROUP_SIZE = 4;
+constexpr int FP16_GEMV_SIMD_W = 128;
+
+template<typename DT>
+static void launch_fp16_gemv(
+    const DT* x, const DT* weight, DT* output,
+    int M, int N, int K, sycl::queue& q) {
+
+    auto range = sycl::nd_range<2>(
+        sycl::range<2>(N, FP16_GEMV_GROUP_SIZE),
+        sycl::range<2>(1, FP16_GEMV_GROUP_SIZE));
+
+    q.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(range, [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL {
+            fp16_gemv_kernel<DT, FP16_GEMV_SIMD_W, FP16_GEMV_GROUP_SIZE>(
+                x, weight, output, M, N, K, item);
+        });
+    });
+}
+
+
+at::Tensor esimd_fp16_gemv(
+    at::Tensor x,
+    at::Tensor weight,
+    at::Tensor output) {
+
+    TORCH_CHECK(x.dim() == 2, "x must be 2D [M, K]");
+    TORCH_CHECK(weight.dim() == 2, "weight must be 2D [N, K]");
+    TORCH_CHECK(output.dim() == 2, "output must be 2D [M, N]");
+
+    const int M = x.size(0);
+    const int K = x.size(1);
+    const int N = weight.size(0);
+
+    TORCH_CHECK(M >= 1 && M <= 8, "M must be 1..8");
+    TORCH_CHECK(weight.size(1) == K, "weight K dim must match input K");
+    TORCH_CHECK(K % (FP16_GEMV_GROUP_SIZE * FP16_GEMV_SIMD_W) == 0,
+                "K must be divisible by GROUP_SIZE * SIMD_W (512)");
+    TORCH_CHECK(output.size(0) == M && output.size(1) == N, "output shape mismatch");
+    TORCH_CHECK(weight.scalar_type() == x.scalar_type(),
+                "weight dtype must match input dtype");
+
+    sycl::queue& queue = c10::xpu::getCurrentXPUStream(x.device().index()).queue();
+
+    switch (x.scalar_type()) {
+        case at::kHalf:
+            launch_fp16_gemv<fp16>(
+                (const fp16*)x.data_ptr(), (const fp16*)weight.data_ptr(),
+                (fp16*)output.data_ptr(), M, N, K, queue);
+            break;
+        case at::kBFloat16:
+            launch_fp16_gemv<bf16>(
+                (const bf16*)x.data_ptr(), (const bf16*)weight.data_ptr(),
+                (bf16*)output.data_ptr(), M, N, K, queue);
+            break;
+        default:
+            TORCH_CHECK(false, "esimd_fp16_gemv: unsupported dtype (expected fp16 or bf16)");
+    }
 
     return output;
 }

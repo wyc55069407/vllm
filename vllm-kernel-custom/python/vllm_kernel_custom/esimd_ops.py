@@ -362,6 +362,19 @@ def esimd_w4a16_gemv(
     return _ops.esimd_w4a16_gemv(x, weight, scales, output, group_size)
 
 
+def esimd_fp16_gemv(
+    x: torch.Tensor, weight: torch.Tensor, output: torch.Tensor,
+) -> torch.Tensor:
+    """FP16/BF16 GEMV: y[M,N] = weight[N,K] @ x[M,K]^T (unquantized).
+
+    Args:
+        x:       [M, K]  bf16/fp16  — input activations (M=1..8)
+        weight:  [N, K]  bf16/fp16  — weight matrix (same dtype as x)
+        output:  [M, N]  bf16/fp16  — pre-allocated output
+    """
+    return _ops.esimd_fp16_gemv(x, weight, output)
+
+
 def esimd_w4a16_gate_up_silu(
     x: torch.Tensor, weight: torch.Tensor, scales: torch.Tensor,
     output: torch.Tensor, N_half: int, group_size: int,

@@ -31,11 +31,13 @@ if os.environ.get("MINICPM5_ESIMD_MOE", "0") == "1":
 # ESIMD GEMV kernels for shared expert (enabled by MINICPM5_ESIMD_GEMV=1)
 _esimd_w4a16_gemv = None
 _esimd_w4a16_gate_up_silu = None
+_esimd_fp16_gemv = None
 _esimd_rope_available = False
 if os.environ.get("MINICPM5_ESIMD_GEMV", "0") == "1":
     try:
         from vllm_kernel_custom.esimd_ops import esimd_w4a16_gemv as _esimd_w4a16_gemv
         from vllm_kernel_custom.esimd_ops import esimd_w4a16_gate_up_silu as _esimd_w4a16_gate_up_silu
+        from vllm_kernel_custom.esimd_ops import esimd_fp16_gemv as _esimd_fp16_gemv
         # esimd_rope is available once vllm_kernel_custom is loaded
         import torch as _torch
         _torch.ops.vllm_kernel_custom.esimd_rope
@@ -486,7 +488,15 @@ class MiniCPM5MoEMoE(nn.Module):
     ) -> torch.Tensor:
         """ESIMD MoE decode fast path: routing + ESIMD kernel + shared expert."""
         # 1. Routing: fused sigmoid+topk or PyTorch fallback
-        router_logits, _ = self.gate(hidden_states)
+        if _esimd_fp16_gemv is not None and num_tokens <= 8:
+            gate_w = self.gate.weight  # [E, K] bf16
+            tmp = torch.empty(num_tokens, gate_w.shape[0],
+                              dtype=hidden_states.dtype,
+                              device=hidden_states.device)
+            _esimd_fp16_gemv(hidden_states, gate_w, tmp)
+            router_logits = tmp.float()
+        else:
+            router_logits, _ = self.gate(hidden_states)
         topk_weights, topk_ids = self._esimd_routing(router_logits, num_tokens)
 
         # 2. ESIMD MoE decode kernel (routed experts)
@@ -547,11 +557,12 @@ class MiniCPM5MoEMoE(nn.Module):
             MiniCPM5MoEMoE._esimd_logged = True
             logger.warning(
                 "ESIMD MoE decode: M=%d, K=%d, topk=%d, group_size=%d, "
-                "transposed_scales=%s, fused_topk=%s",
+                "transposed_scales=%s, fused_topk=%s, esimd_gate=%s",
                 num_tokens, hidden_dim,
                 self.experts.moe_config.experts_per_token, group_size,
                 _esimd_moe_decode_ts is not None,
                 _esimd_moe_sigmoid_topk is not None,
+                _esimd_fp16_gemv is not None,
             )
 
         return final_hidden_states.view(num_tokens, hidden_dim)
@@ -563,7 +574,15 @@ class MiniCPM5MoEMoE(nn.Module):
     ) -> torch.Tensor:
         """ESIMD MoE prefill fast path: routing + ESIMD GGEMV/oneDNN + shared expert."""
         # 1. Routing: fused sigmoid+topk or PyTorch fallback
-        router_logits, _ = self.gate(hidden_states)
+        if _esimd_fp16_gemv is not None and num_tokens <= 8:
+            gate_w = self.gate.weight  # [E, K] bf16
+            tmp = torch.empty(num_tokens, gate_w.shape[0],
+                              dtype=hidden_states.dtype,
+                              device=hidden_states.device)
+            _esimd_fp16_gemv(hidden_states, gate_w, tmp)
+            router_logits = tmp.float()
+        else:
+            router_logits, _ = self.gate(hidden_states)
         topk_weights, topk_ids = self._esimd_routing(router_logits, num_tokens)
 
         # 2. ESIMD MoE prefill kernel (requires fp16 — kernel is hardcoded sycl::half)
@@ -1128,10 +1147,32 @@ class MiniCPM5MoEForCausalLM(nn.Module, SupportsPP):
         print(f"{'='*80}\n", file=sys.stderr)
         sys.stderr.flush()
 
+    _esimd_lm_head_logged = False
+
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
+        num_tokens = hidden_states.shape[0]
+        if _esimd_fp16_gemv is not None and num_tokens <= 8:
+            try:
+                weight = self.lm_head.weight  # [vocab_padded, K] bf16
+                N, K = weight.shape
+                out = torch.empty(num_tokens, N,
+                                  dtype=hidden_states.dtype,
+                                  device=hidden_states.device)
+                _esimd_fp16_gemv(hidden_states, weight, out)
+                logits = out[..., :self.config.vocab_size].float()
+                if not MiniCPM5MoEForCausalLM._esimd_lm_head_logged:
+                    MiniCPM5MoEForCausalLM._esimd_lm_head_logged = True
+                    logger.warning(
+                        "ESIMD FP16 GEMV lm_head active: M=%d, N=%d, K=%d",
+                        num_tokens, N, K)
+                return logits
+            except Exception as e:
+                if not MiniCPM5MoEForCausalLM._esimd_lm_head_logged:
+                    MiniCPM5MoEForCausalLM._esimd_lm_head_logged = True
+                    logger.warning("ESIMD FP16 GEMV lm_head fallback: %s", e)
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
