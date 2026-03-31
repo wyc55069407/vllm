@@ -564,7 +564,8 @@ class GPTQLinearMethod(LinearMethodBase):
 
                 # ESIMD GEMV fast path for decode (M<=8)
                 if (M <= 8
-                    and os.environ.get("MINICPM5_ESIMD_GEMV", "0") == "1"
+                    and (os.environ.get("MINICPM5_ESIMD_GEMV", "0") == "1"
+                         or os.environ.get("MINICPM4_ESIMD_GEMV", "0") == "1")
                     and hasattr(layer, 'esimd_scales_fp16')):
                     try:
                         esimd_scales = (

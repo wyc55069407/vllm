@@ -24,7 +24,9 @@
 # limitations under the License.
 """Inference-only MiniCPM model compatible with HuggingFace weights."""
 
+import logging
 import math
+import os
 from collections.abc import Iterable
 from itertools import islice
 from typing import Any
@@ -32,6 +34,22 @@ from typing import Any
 import torch
 from torch import nn
 from transformers import PretrainedConfig
+
+logger = logging.getLogger(__name__)
+
+# ESIMD decode optimizations (enabled by MINICPM4_ESIMD_GEMV=1)
+_esimd_fp16_gemv = None
+_esimd_rope_available = False
+if os.environ.get("MINICPM4_ESIMD_GEMV", "0") == "1":
+    try:
+        from vllm_kernel_custom.esimd_ops import (
+            esimd_fp16_gemv as _esimd_fp16_gemv,
+        )
+        import torch as _torch
+        _torch.ops.vllm_kernel_custom.esimd_rope
+        _esimd_rope_available = True
+    except (ImportError, AttributeError):
+        pass
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
@@ -300,7 +318,40 @@ class MiniCPMAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
+        num_tokens = q.shape[0]
+        if (
+            _esimd_rope_available
+            and num_tokens <= 8
+            and self.head_dim in (64, 128)
+        ):
+            # ESIMD fused neox-style RoPE: 1 kernel instead of 8 elementwise
+            rotary_emb = self.rotary_emb
+            if hasattr(rotary_emb, 'long_short_cos_sin_cache'):
+                cos_sin_cache = rotary_emb.long_short_cos_sin_cache
+                if getattr(rotary_emb, 'use_long_rope', False):
+                    eff_positions = (positions
+                                    + rotary_emb.original_max_position_embeddings)
+                else:
+                    eff_positions = positions
+            else:
+                cos_sin_cache = rotary_emb.cos_sin_cache
+                eff_positions = positions
+            cos_sin_cache = cos_sin_cache.to(q.dtype)
+            hd = self.head_dim
+            torch.ops.vllm_kernel_custom.esimd_rope(
+                q, k, cos_sin_cache,
+                eff_positions, eff_positions,
+                self.num_heads, hd, hd,
+                self.num_kv_heads, hd, hd,
+                self.num_kv_heads * hd,
+                num_tokens, 2,  # flag=2 = neox style
+            )
+            if not getattr(MiniCPMAttention, '_esimd_rope_logged', False):
+                MiniCPMAttention._esimd_rope_logged = True
+                logger.warning("ESIMD neox RoPE active: M=%d, heads=%d, hd=%d",
+                               num_tokens, self.num_heads, hd)
+        else:
+            q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
@@ -642,10 +693,32 @@ class MiniCPMForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
                 hidden_states = model_output / self.scale_width
                 return hidden_states
 
+    _esimd_lm_head_logged = False
+
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
+        num_tokens = hidden_states.shape[0]
+        if _esimd_fp16_gemv is not None and num_tokens <= 8:
+            try:
+                weight = self.lm_head.weight  # [73448, 4096] bf16
+                N, K = weight.shape
+                out = torch.empty(num_tokens, N,
+                                  dtype=hidden_states.dtype,
+                                  device=hidden_states.device)
+                _esimd_fp16_gemv(hidden_states, weight, out)
+                logits = out[..., :self.config.vocab_size].float()
+                if not MiniCPMForCausalLM._esimd_lm_head_logged:
+                    MiniCPMForCausalLM._esimd_lm_head_logged = True
+                    logger.warning(
+                        "ESIMD FP16 GEMV lm_head active: M=%d, N=%d, K=%d",
+                        num_tokens, N, K)
+                return logits
+            except Exception as e:
+                if not MiniCPMForCausalLM._esimd_lm_head_logged:
+                    MiniCPMForCausalLM._esimd_lm_head_logged = True
+                    logger.warning("ESIMD FP16 GEMV lm_head fallback: %s", e)
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 

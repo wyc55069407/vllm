@@ -34,7 +34,7 @@ MODELS = {
         "name": "MiniCPM4-8B-GPTQ-Int4",
         "base_max_model_len": 32768,
         "env_moe": "MINICPM4_ESIMD_MOE",
-        "env_gemv": None,
+        "env_gemv": "MINICPM4_ESIMD_GEMV",
     },
     "16b": {
         "path": "/home/sas/yuchen/vllm_env/models/minicpm5.16a3.v0314-GPTQ-Int4",
