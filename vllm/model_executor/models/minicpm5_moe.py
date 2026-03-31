@@ -324,11 +324,10 @@ class MiniCPM5MoEMoE(nn.Module):
             else None,
         )
 
-        self.gate.set_out_dtype(
-            torch.float32
-            if self.experts.quant_method.is_monolithic
-            else torch.bfloat16
-        )
+        # MiniCPM5 vendor reference always uses fp32 for router gate output.
+        # is_monolithic=False for GPTQ would default to bf16, losing routing
+        # precision. Force fp32 to match vendor behavior.
+        self.gate.set_out_dtype(torch.float32)
 
     _moe_inspected = False
     _esimd_logged = False
@@ -439,11 +438,8 @@ class MiniCPM5MoEMoE(nn.Module):
         if self.shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)
 
-        # 4. Apply routed_scaling_factor
-        if hidden_states.dtype != torch.float16:
-            final_hidden_states = final_hidden_states * self.routed_scaling_factor
-        elif shared_output is not None:
-            shared_output = shared_output * (1.0 / self.routed_scaling_factor)
+        # 4. Apply routed_scaling_factor (vendor: always scale routed output)
+        final_hidden_states = final_hidden_states * self.routed_scaling_factor
 
         # 5. Add shared expert output
         if shared_output is not None:
@@ -515,11 +511,8 @@ class MiniCPM5MoEMoE(nn.Module):
         if self.shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)
 
-        # 4. Apply routed_scaling_factor
-        if hidden_states.dtype != torch.float16:
-            final_hidden_states = final_hidden_states * self.routed_scaling_factor
-        elif shared_output is not None:
-            shared_output = shared_output * (1.0 / self.routed_scaling_factor)
+        # 4. Apply routed_scaling_factor (vendor: always scale routed output)
+        final_hidden_states = final_hidden_states * self.routed_scaling_factor
 
         # 5. Add shared expert output
         if shared_output is not None:
@@ -643,12 +636,9 @@ class MiniCPM5MoEMoE(nn.Module):
         if self.shared_experts is None:
             assert shared_output is None
 
-        if hidden_states.dtype != torch.float16:
-            if not self.is_rocm_aiter_moe_enabled:
-                final_hidden_states *= self.routed_scaling_factor
-        elif self.shared_experts is not None:
-            assert shared_output is not None
-            shared_output *= 1.0 / self.routed_scaling_factor
+        # Apply routed_scaling_factor (vendor: always scale routed output)
+        if not self.is_rocm_aiter_moe_enabled:
+            final_hidden_states *= self.routed_scaling_factor
 
         if self.shared_experts is not None:
             assert shared_output is not None
@@ -731,6 +721,23 @@ class MiniCPM5MoEDecoderLayer(nn.Module):
                 cls._profile_data = []  # list of (step, layer, attn_ms, mlp_ms, total_ms, n_tokens)
         return cls._profile_enabled
 
+    _nan_check = os.environ.get("MINICPM5_NAN_CHECK", "0") == "1"
+    _nan_step = 0
+
+    @staticmethod
+    def _check_tensor(name, t, layer_idx, step):
+        """Lightweight NaN/inf check — samples first token only."""
+        if t is None:
+            return
+        sample = t[0] if t.dim() > 1 else t
+        has_nan = torch.isnan(sample).any().item()
+        has_inf = torch.isinf(sample).any().item()
+        if has_nan or has_inf:
+            absmax = t.abs().max().item()
+            print(f"[NAN_CHECK] step={step} layer={layer_idx} {name}: "
+                  f"nan={has_nan} inf={has_inf} absmax={absmax} "
+                  f"shape={list(t.shape)} dtype={t.dtype}", flush=True)
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -738,11 +745,16 @@ class MiniCPM5MoEDecoderLayer(nn.Module):
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         do_profile = self._is_profile_enabled()
+        do_nan = self._nan_check
 
         if do_profile:
             n_tokens = hidden_states.shape[0]
             torch.xpu.synchronize()
             t_start = time.perf_counter()
+
+        if do_nan and self.layer_idx == 0:
+            self._check_tensor("input", hidden_states, 0,
+                               self.__class__._nan_step)
 
         if residual is None:
             residual = hidden_states.clone()
@@ -755,6 +767,10 @@ class MiniCPM5MoEDecoderLayer(nn.Module):
             t_attn_start = time.perf_counter()
 
         hidden_states = self.self_attn(positions, hidden_states)
+
+        if do_nan:
+            self._check_tensor("post_attn", hidden_states, self.layer_idx,
+                               self.__class__._nan_step)
 
         if do_profile:
             torch.xpu.synchronize()
@@ -769,6 +785,15 @@ class MiniCPM5MoEDecoderLayer(nn.Module):
             t_mlp_start = time.perf_counter()
 
         hidden_states = self.mlp(hidden_states)
+
+        if do_nan:
+            self._check_tensor("post_mlp", hidden_states, self.layer_idx,
+                               self.__class__._nan_step)
+            self._check_tensor("residual", residual, self.layer_idx,
+                               self.__class__._nan_step)
+            # Increment step counter after last layer
+            if self.layer_idx == 27:
+                self.__class__._nan_step += 1
 
         if do_profile:
             torch.xpu.synchronize()
@@ -843,9 +868,17 @@ class MiniCPM5MoEModel(nn.Module):
             residual = intermediate_tensors["residual"]
 
         from itertools import islice
+        import torch as _torch
 
+        is_prefill = hidden_states.shape[0] > 1
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual = layer(positions, hidden_states, residual)
+            # Flush GPU command queue each layer during prefill to avoid
+            # xe driver job_timeout (default 5s on BMG). Without this,
+            # async kernel submissions accumulate and total GPU time
+            # exceeds the timeout, causing DEVICE_LOST.
+            if is_prefill and hasattr(_torch, "xpu"):
+                _torch.xpu.synchronize()
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(

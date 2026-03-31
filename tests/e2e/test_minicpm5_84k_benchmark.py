@@ -137,7 +137,14 @@ if __name__ == "__main__":
     )
     parser.add_argument("--max-tokens", type=int, default=2048,
                         help="Max output tokens (includes thinking)")
-
+    parser.add_argument("--temperature", type=float, default=0.6,
+                        help="Sampling temperature (0.6 recommended for thinking model)")
+    parser.add_argument("--repetition-penalty", type=float, default=1.0,
+                        help="Repetition penalty (1.0=off, 1.2=recommended)")
+    parser.add_argument("--top-k", type=int, default=-1,
+                        help="Top-k sampling (-1=off)")
+    parser.add_argument("--top-p", type=float, default=1.0,
+                        help="Top-p (nucleus) sampling (1.0=off)")
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--no-warmup", action="store_true")
     parser.add_argument("--signal-ready", action="store_true",
@@ -170,12 +177,13 @@ if __name__ == "__main__":
         trust_remote_code=True,
         enforce_eager=True,
         disable_log_stats=True,
-        gpu_memory_utilization=0.90,
+        gpu_memory_utilization=0.85,
         max_model_len=131072,
         max_num_seqs=1,
         block_size=128,
         enable_prefix_caching=False,
         attention_backend=backend,
+        max_num_batched_tokens=2048,
     )
 
     if hasattr(torch, "xpu"):
@@ -189,8 +197,14 @@ if __name__ == "__main__":
     # MiniCPM5 is a thinking model: <think>...</think> then response.
     # Use <|im_end|> (id=130073) as stop token. Budget extra tokens for thinking.
     im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
-    sp = SamplingParams(temperature=0, max_tokens=args.max_tokens,
-                        stop_token_ids=[im_end_id])
+    # GPTQ-Int4 thinking model needs temperature>0 to avoid greedy thinking
+    # loops. temp=0.6 produces good quality with reasonable think length.
+    sp = SamplingParams(temperature=args.temperature, max_tokens=args.max_tokens,
+                        stop_token_ids=[im_end_id],
+                        repetition_penalty=args.repetition_penalty,
+                        top_k=args.top_k, top_p=args.top_p)
+    print(f"Sampling: temp={args.temperature}, rep_pen={args.repetition_penalty}, "
+          f"top_k={args.top_k}, top_p={args.top_p}")
 
     # Warmup
     if not args.no_warmup:
