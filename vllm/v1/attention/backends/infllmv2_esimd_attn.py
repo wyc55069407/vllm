@@ -50,7 +50,44 @@ INFLLMV2_USE_SPARSE_PREFILL = os.environ.get("INFLLMV2_SPARSE_PREFILL", "1") != 
 # Sparse decode: controllable via env var. Default ON (last-block fix verified).
 INFLLMV2_USE_SPARSE_DECODE = os.environ.get("INFLLMV2_SPARSE_DECODE", "1") != "0"
 INFLLMV2_DEBUG_TRACE = os.environ.get("INFLLMV2_DEBUG_TRACE", "0") != "0"
+INFLLMV2_HOST_TIMING = os.environ.get("INFLLMV2_HOST_TIMING", "0") != "0"
 _trace_call_count = 0  # module-level counter for sampling
+
+# Lightweight host timing accumulator (toggled by INFLLMV2_HOST_TIMING=1)
+import time as _time
+_host_timers: dict[str, list[float]] = {}
+_host_timer_step = 0
+
+
+def _ht_reset():
+    global _host_timers, _host_timer_step
+    _host_timers.clear()
+    _host_timer_step = 0
+
+
+def _ht_record(name: str, dt: float):
+    if name not in _host_timers:
+        _host_timers[name] = []
+    _host_timers[name].append(dt)
+
+
+def _ht_report(num_layers: int = 28):
+    """Print per-decode-step timing summary."""
+    global _host_timer_step
+    if not _host_timers:
+        return
+    print(f"\n=== InfLLMv2 Host Timing ({_host_timer_step} steps, "
+          f"{num_layers} layers) ===")
+    for name, vals in sorted(_host_timers.items()):
+        total = sum(vals)
+        per_step = total / max(1, _host_timer_step) * 1000  # ms
+        avg = total / len(vals) * 1000  # ms
+        print(f"  {name:30s}: {total*1000:8.1f}ms total, "
+              f"{per_step:6.2f}ms/step, {avg:6.3f}ms/call ({len(vals)} calls)")
+    total_all = sum(sum(v) for v in _host_timers.values())
+    print(f"  {'TOTAL':30s}: {total_all*1000:8.1f}ms total, "
+          f"{total_all/_host_timer_step*1000:6.2f}ms/step")
+    print()
 
 
 def _check_tensor(name: str, t: torch.Tensor, step: int):
@@ -272,32 +309,31 @@ class InfLLMv2EsimdAttentionImpl(AttentionImpl):
         return output
 
     def _ensure_decode_bufs(self, batch, num_pooled_blocks, num_pooled, device):
-        """Pre-allocate decode intermediate buffers (reused across steps)."""
+        """Pre-allocate decode intermediate buffers (reused across steps).
+
+        No zeroing needed — all buffers are fully overwritten by the
+        pattern_decode kernels (confirmed by kernel code analysis).
+        """
         if (self._decode_bufs_ready
                 and self._decode_batch >= batch
                 and self._decode_num_pooled_blocks >= num_pooled_blocks
                 and self._decode_num_pooled >= num_pooled):
-            # Buffers are large enough — zero only the used portions
-            self._buf_block_scores[:batch, :, :, :num_pooled_blocks].zero_()
-            self._buf_kv_block_scores[:batch, :, :, :num_pooled_blocks].zero_()
-            self._buf_pooled_scores[:batch, :, :, :num_pooled].zero_()
-            self._buf_topk_output[:batch, :, :, :].zero_()
             return
 
         nh, nkvh, hd = self.num_heads, self.num_kv_heads, self.head_size
         self._decode_batch = batch
         self._decode_num_pooled_blocks = num_pooled_blocks
         self._decode_num_pooled = num_pooled
-        self._buf_block_scores = torch.zeros(
+        self._buf_block_scores = torch.empty(
             batch, nh, 1, num_pooled_blocks,
             dtype=torch.float16, device=device)
-        self._buf_kv_block_scores = torch.zeros(
+        self._buf_kv_block_scores = torch.empty(
             batch, nkvh, 1, num_pooled_blocks,
             dtype=torch.float16, device=device)
-        self._buf_pooled_scores = torch.zeros(
+        self._buf_pooled_scores = torch.empty(
             batch, nkvh, 1, num_pooled,
             dtype=torch.float16, device=device)
-        self._buf_topk_output = torch.zeros(
+        self._buf_topk_output = torch.empty(
             batch, nkvh, 1, self.topk,
             dtype=torch.int32, device=device)
         if self._buf_dummy_mask_cnt is None:
@@ -318,6 +354,7 @@ class InfLLMv2EsimdAttentionImpl(AttentionImpl):
         blocks when seq_len increments by 1 (typical decode). Falls back to
         full recompute on mismatch (new request, after prefill, etc.).
         """
+        _ht = INFLLMV2_HOST_TIMING
         batch = attn_metadata.seq_lens.shape[0]
         block_size = kv_cache.shape[2]
         device = query.device
@@ -335,6 +372,9 @@ class InfLLMv2EsimdAttentionImpl(AttentionImpl):
             1, (num_pooled_blocks + pooling_stride - 1) // pooling_stride)
 
         # Step 1: Incremental K pooling
+        if _ht:
+            torch.xpu.synchronize()
+            _t0 = _time.perf_counter()
         # Check if we can reuse cached pooled_k (batch=1 typical case)
         cached_sl = self._cached_seq_len.get(0, 0)
         if (batch == 1 and cached_sl > 0 and max_sl == cached_sl + 1
@@ -373,6 +413,9 @@ class InfLLMv2EsimdAttentionImpl(AttentionImpl):
                 block_size, num_pooled_blocks,
                 self.kernel_size, self.kernel_stride,
                 0)
+        if _ht:
+            torch.xpu.synchronize()
+            _ht_record("k_pooling", _time.perf_counter() - _t0)
 
         # Cache for next decode step
         if batch == 1:
@@ -389,14 +432,26 @@ class InfLLMv2EsimdAttentionImpl(AttentionImpl):
                 _check_tensor("decode_query", query, _trace_call_count)
 
         # Step 2: Pattern detection (decode) — use pre-allocated buffers
+        if _ht:
+            _t0 = _time.perf_counter()
         q_for_pattern = query.view(batch, nh, hd).unsqueeze(2)  # [B, nh, 1, hd]
         if q_for_pattern.dtype != torch.float16:
             q_for_pattern = q_for_pattern.half()
+        if _ht:
+            torch.xpu.synchronize()
+            _ht_record("q_reshape+half", _time.perf_counter() - _t0)
 
+        if _ht:
+            _t0 = _time.perf_counter()
         self._ensure_decode_bufs(batch, num_pooled_blocks, num_pooled, device)
+        if _ht:
+            torch.xpu.synchronize()
+            _ht_record("zero_bufs", _time.perf_counter() - _t0)
 
         cache_len = max_sl - 1  # history before this token
 
+        if _ht:
+            _t0 = _time.perf_counter()
         self._esimd_pattern_decode(
             q_for_pattern, k_pooled,
             self._buf_block_scores[:batch, :, :, :num_pooled_blocks],
@@ -409,6 +464,9 @@ class InfLLMv2EsimdAttentionImpl(AttentionImpl):
             cache_len, 1,
             self.init_blocks, self.local_blocks,
             self.topk)
+        if _ht:
+            torch.xpu.synchronize()
+            _ht_record("pattern_decode", _time.perf_counter() - _t0)
 
         # NaN/inf check on pattern detection outputs
         if INFLLMV2_DEBUG_TRACE:
@@ -423,6 +481,8 @@ class InfLLMv2EsimdAttentionImpl(AttentionImpl):
             sparse_mask = self._buf_topk_output[:batch].squeeze(2).int()
 
             # Force-insert last sparse block on GPU (no CPU sync)
+            if _ht:
+                _t0 = _time.perf_counter()
             self._esimd_force_last_block(
                 sparse_mask, attn_metadata.seq_lens,
                 nkvh, self.sparse_block)
@@ -438,6 +498,9 @@ class InfLLMv2EsimdAttentionImpl(AttentionImpl):
                 max_sl, self.scale,
                 1,  # is_decode=True
                 self.topk)
+            if _ht:
+                torch.xpu.synchronize()
+                _ht_record("force+sparse_sdp", _time.perf_counter() - _t0)
 
             # Debug: check sparse decode output
             if INFLLMV2_DEBUG_TRACE:
@@ -446,7 +509,12 @@ class InfLLMv2EsimdAttentionImpl(AttentionImpl):
                                   _trace_call_count)
         else:
             # Dense fallback (pattern detection ran but we ignore its output)
+            if _ht:
+                _t0 = _time.perf_counter()
             self._forward_dense(query, kv_cache, output, attn_metadata)
+            if _ht:
+                torch.xpu.synchronize()
+                _ht_record("dense_sdp_fallback", _time.perf_counter() - _t0)
 
         return output
 
@@ -784,17 +852,44 @@ class InfLLMv2EsimdAttentionImpl(AttentionImpl):
         max_seq_len = attn_metadata.max_seq_len
         is_decode = (attn_metadata.max_query_len == 1)
 
+        _ht = INFLLMV2_HOST_TIMING
+
+        # Track decode steps: increment when first layer sees decode
+        if _ht and is_decode and not hasattr(self, '_ht_layer_idx'):
+            # Assign layer index based on creation order
+            if not hasattr(InfLLMv2EsimdAttentionImpl, '_ht_next_idx'):
+                InfLLMv2EsimdAttentionImpl._ht_next_idx = 0
+            self._ht_layer_idx = InfLLMv2EsimdAttentionImpl._ht_next_idx
+            InfLLMv2EsimdAttentionImpl._ht_next_idx += 1
+        if _ht and is_decode and getattr(self, '_ht_layer_idx', -1) == 0:
+            global _host_timer_step
+            _host_timer_step += 1
+            if _host_timer_step % 16 == 0:
+                _ht_report(num_layers=28)
+
         if max_seq_len <= self.dense_len:
             # Short sequence: use dense attention
+            if _ht:
+                torch.xpu.synchronize()
+                _t0 = _time.perf_counter()
             self._forward_dense(q_slice, kv_cache, o_slice, attn_metadata)
+            if _ht:
+                torch.xpu.synchronize()
+                _ht_record("short_dense_sdp", _time.perf_counter() - _t0)
         elif is_decode:
             if not INFLLMV2_USE_SPARSE_DECODE:
                 # Sparse decode disabled — skip pattern detection entirely
                 logger.info_once(
                     "InfLLMv2 decode: dense fallback (max_seq_len=%d)",
                     max_seq_len)
+                if _ht:
+                    torch.xpu.synchronize()
+                    _t0 = _time.perf_counter()
                 self._forward_dense(
                     q_slice, kv_cache, o_slice, attn_metadata)
+                if _ht:
+                    torch.xpu.synchronize()
+                    _ht_record("long_dense_sdp", _time.perf_counter() - _t0)
             else:
                 # Long decode: pattern detection + sparse SDP
                 logger.info_once(
