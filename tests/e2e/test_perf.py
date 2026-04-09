@@ -45,35 +45,34 @@ MODELS = {
     },
 }
 
-def get_rope_scaling(model_key, max_prefill):
+def get_rope_scaling(model_key, max_prefill, force_rope=False):
     """Return (max_model_len, hf_overrides) with rope scaling if needed.
 
     MiniCPM4-8B has base max_position_embeddings=32768 with LongRoPE.
     For prefill > 32K, use dynamic NTK rope scaling to extend.
-    MiniCPM5-16B natively supports 131072, no scaling needed.
+    MiniCPM5-16B natively supports 131072, no scaling needed unless forced.
     """
     cfg = MODELS[model_key]
     base = cfg["base_max_model_len"]
 
-    if max_prefill + 2048 <= base:
+    if not force_rope and max_prefill + 2048 <= base:
         # Plenty of room, no scaling needed
         return base, None
 
-    if model_key == "8b":
-        # Dynamic NTK rope scaling for MiniCPM4-8B beyond 32K
-        factor = max(2.0, (max_prefill + 2048) / 32768)
-        new_max = int(32768 * factor)
-        hf_overrides = {
-            "max_position_embeddings": new_max,
-            "rope_scaling": {
-                "rope_type": "dynamic",
-                "factor": factor,
-            }
+    # Apply dynamic NTK rope scaling
+    orig_base = 32768 if model_key == "8b" else base
+    factor = max(2.0, (max_prefill + 2048) / orig_base)
+    new_max = int(orig_base * factor)
+    hf_overrides = {
+        "max_position_embeddings": new_max,
+        "rope_scaling": {
+            "rope_type": "dynamic",
+            "factor": factor,
         }
-        return new_max, hf_overrides
-    else:
-        # MiniCPM5-16B: native 131K support
-        return base, None
+    }
+    # force_rope: apply scaling but keep original max_model_len
+    max_model_len = base if force_rope else new_max
+    return max_model_len, hf_overrides
 
 CORPUS_PATH = os.path.join(os.path.dirname(__file__), "wiki_corpus.json")
 
@@ -225,6 +224,8 @@ if __name__ == "__main__":
                         help="Repetition penalty (1.0=off)")
     parser.add_argument("--temperature", type=float, default=0.0,
                         help="Sampling temperature (0=greedy)")
+    parser.add_argument("--force-rope", action="store_true",
+                        help="Force dynamic NTK rope scaling even for 16B model")
     args = parser.parse_args()
 
     model_cfg = MODELS[args.model]
@@ -260,7 +261,8 @@ if __name__ == "__main__":
 
     # Compute rope scaling based on max prefill requested
     max_prefill = max(args.prefill)
-    max_model_len, hf_overrides = get_rope_scaling(args.model, max_prefill)
+    max_model_len, hf_overrides = get_rope_scaling(args.model, max_prefill,
+                                                    args.force_rope)
 
     moe_label = "ESIMD" if not args.no_esimd_moe else "Triton"
     all_results = []
