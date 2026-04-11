@@ -46,33 +46,29 @@ MODELS = {
 }
 
 def get_rope_scaling(model_key, max_prefill, force_rope=False):
-    """Return (max_model_len, hf_overrides) with rope scaling if needed.
+    """Return (max_model_len, hf_overrides) for the requested prefill length.
 
-    MiniCPM4-8B has base max_position_embeddings=32768 with LongRoPE.
-    For prefill > 32K, use dynamic NTK rope scaling to extend.
-    MiniCPM5-16B natively supports 131072, no scaling needed unless forced.
+    Both MiniCPM4-8B and MiniCPM5-16B use LongRoPE with trained
+    per-dimension long_factor/short_factor arrays.  Do NOT override
+    rope_type — that would discard the trained factors and use a
+    generic dynamic/NTK scheme instead.
+
+    Just extend max_position_embeddings.  Phi3LongRoPEScaledRotaryEmbedding
+    (vLLM) auto-selects long_factor when max_model_len > original_max and
+    computes the cos/sin cache up to the new max_position_embeddings.
     """
     cfg = MODELS[model_key]
     base = cfg["base_max_model_len"]
 
-    if not force_rope and max_prefill + 2048 <= base:
-        # Plenty of room, no scaling needed
+    if max_prefill + 2048 <= base:
+        # Plenty of room, no extension needed
         return base, None
 
-    # Apply dynamic NTK rope scaling
-    orig_base = 32768 if model_key == "8b" else base
-    factor = max(2.0, (max_prefill + 2048) / orig_base)
-    new_max = int(orig_base * factor)
+    new_max = max_prefill + 2048
     hf_overrides = {
         "max_position_embeddings": new_max,
-        "rope_scaling": {
-            "rope_type": "dynamic",
-            "factor": factor,
-        }
     }
-    # force_rope: apply scaling but keep original max_model_len
-    max_model_len = base if force_rope else new_max
-    return max_model_len, hf_overrides
+    return new_max, hf_overrides
 
 CORPUS_PATH = os.path.join(os.path.dirname(__file__), "wiki_corpus.json")
 
