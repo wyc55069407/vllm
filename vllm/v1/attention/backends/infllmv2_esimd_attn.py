@@ -664,6 +664,43 @@ class InfLLMv2EsimdAttentionImpl(AttentionImpl):
             mask_orig, mask_out, mask_cnt_out,
             q_len, nkvh, total_kv_blocks)
 
+        # ---- Force-insert init blocks + causal-local blocks ----------------
+        # After mask_convert, force-include the first `init_blocks` sparse
+        # blocks (chat template header) and the last `local_blocks` sparse
+        # blocks around each q_block's causal boundary.  Without this, chunked
+        # prefill can miss these critical blocks at certain prompt lengths.
+        # All ops are batched GPU tensors — no .item() calls.
+        sb = self.sparse_block
+        ib = self.init_blocks     # 2
+        lb = self.local_blocks    # 4
+        nf = ib + lb              # 6
+        cache_len_val = max_sl - q_len
+
+        # Causal boundary per q_block [q_blocks]
+        qb_idx = torch.arange(q_blocks, device=device, dtype=torch.int64)
+        last_kv = ((cache_len_val + torch.clamp(
+            (qb_idx + 1) * 16, max=q_len) - 1) // sb).int()
+
+        # Force blocks [q_blocks, nf]: init_0..init_{ib-1}, local_0..local_{lb-1}
+        parts = []
+        for i in range(ib):
+            parts.append(torch.full(
+                (q_blocks,), min(i, total_kv_blocks - 1),
+                dtype=torch.int32, device=device))
+        for i in range(lb):
+            parts.append((last_kv - lb + 1 + i).clamp(min=0))
+        force = torch.stack(parts, dim=1)  # [q_blocks, nf]
+
+        # Write force blocks at tail of each row for ALL heads at once
+        safe_cnt = mask_cnt_out.clamp(max=1024 - nf)
+        offsets = torch.arange(nf, device=device).view(1, 1, nf)
+        write_pos = safe_cnt.unsqueeze(2) + offsets  # [nkvh, q_blocks, nf]
+        force_exp = force.unsqueeze(0).expand(nkvh, -1, -1)
+        mask_out.scatter_(2, write_pos.long(), force_exp)
+        sw = self.topk + nf  # 70
+        mask_out[:, :, :sw] = mask_out[:, :, :sw].sort(dim=2)[0]
+        mask_cnt_out.copy_(safe_cnt + nf)
+
         if INFLLMV2_DEBUG_TRACE:
             mc = mask_cnt_out.cpu()
             mo = mask_out.cpu()
