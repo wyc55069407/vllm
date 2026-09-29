@@ -919,6 +919,10 @@ def _xpu_all_reduce_inplace_impl(x: torch.Tensor, group_name: str) -> None:
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
+    communicator = group.device_communicator
+    inplace = getattr(communicator, "all_reduce_inplace_", None)
+    if inplace is not None and inplace(x):
+        return
     pg = group.device_group
     opts = _XPU_ALL_REDUCE_OPTIONS.get(id(pg))
     if opts is None:

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 
 import torch
 import torch.distributed as dist
@@ -25,7 +26,11 @@ class XpuCommunicator(DeviceCommunicatorBase):
         super().__init__(
             cpu_group, device, device_group, unique_name, use_all2all=use_all2all
         )
-        self.ca_comm: None = None
+        self.ca_comm = None
+        # Opt-in one-shot P2P all-reduce for small tensors at TP=2
+        # (vllm-xpu-kernels custom_all_reduce); XCCL otherwise.
+        if os.environ.get("VLLM_XPU_USE_CUSTOM_ALLREDUCE", "0") == "1":
+            self._init_custom_all_reduce()
         if self.use_all2all:
             if self.all2all_backend in ("naive", "allgather_reducescatter"):
                 from .all2all import AgRsAll2AllManager
@@ -45,10 +50,47 @@ class XpuCommunicator(DeviceCommunicatorBase):
                 self.all2all_manager = AgRsAll2AllManager(self.cpu_group)
                 logger.info("Using AgRs manager on XPU device.")
 
+    def _init_custom_all_reduce(self) -> None:
+        if self.world_size != 2 or self.device is None:
+            return
+        try:
+            from vllm_xpu_kernels.custom_all_reduce import (
+                XpuCustomAllReduce,
+                is_available,
+            )
+        except ImportError:
+            return
+        if not is_available():
+            return
+        try:
+            ca = XpuCustomAllReduce(self.cpu_group, self.device)
+        except Exception as e:  # IPC / P2P not available on this system
+            logger.warning("XPU custom all-reduce disabled: %s", e)
+            return
+        if not ca.disabled:
+            self.ca_comm = ca
+            logger.info("Using the XPU custom all-reduce for small tensors.")
+
+    def all_reduce_inplace_(self, input_: torch.Tensor) -> bool:
+        """In-place all-reduce with the custom all-reduce if it can take the
+        tensor; returns False (nothing done) otherwise."""
+        ca = self.ca_comm
+        if ca is None or not ca.can_use(input_):
+            return False
+        ca.all_reduce_(input_)
+        return True
+
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         output = input_.clone()
-        dist.all_reduce(output, group=self.device_group)
+        if not self.all_reduce_inplace_(output):
+            dist.all_reduce(output, group=self.device_group)
         return output
+
+    def destroy(self):
+        if self.ca_comm is not None:
+            self.ca_comm.close()
+            self.ca_comm = None
+        super().destroy()
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
         world_size = self.world_size
