@@ -55,6 +55,12 @@ if current_platform.is_cuda():
 if current_platform.is_xpu():
     from .fusion.act_quant_fusion import ActivationQuantFusionPass
     from .fusion.rms_quant_fusion import RMSNormQuantFusionPass
+    from .fusion.xpu_fp8_gemm_pair_fusion import XpuFp8GemmPairFusionPass
+    from .fusion.xpu_moe_shared_fusion import XpuMoESharedFusionPass
+    from .fusion.xpu_norm_fp8_gemm_fusion import XpuNormFp8GemmFusionPass
+    from .fusion.xpu_qkv_norm_rope_fusion import XpuQkvNormRopeFusionPass
+    from .utility.xpu_all_reduce_inplace import XpuAllReduceInplacePass
+    from .utility.xpu_gdn_output_alloc import XpuGdnOutputAllocPass
 
 from .inductor_pass import (
     CustomGraphPass,
@@ -225,6 +231,26 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
             if self.pass_config.enable_qk_norm_rope_fusion:
                 self.passes += [SplitCoalescingPass(config)]
                 self.passes += [QKNormRoPEFusionPass(config)]
+
+            if self.pass_config.fuse_xpu_moe_shared:
+                self.passes += [XpuMoESharedFusionPass(config)]
+
+            if self.pass_config.fuse_xpu_qkv_norm_rope:
+                self.passes += [XpuQkvNormRopeFusionPass(config)]
+
+            if self.pass_config.fuse_xpu_fp8_gemm_pair:
+                self.passes += [XpuFp8GemmPairFusionPass(config)]
+
+            # After the MoE (which takes its own input norm) and pair fusions.
+            if self.pass_config.fuse_xpu_norm_fp8_gemm:
+                self.passes += [XpuNormFp8GemmFusionPass(config)]
+
+            if self.pass_config.xpu_gdn_output_alloc:
+                self.passes += [XpuGdnOutputAllocPass(config)]
+
+            # After the fusions, which may change the all-reduce inputs.
+            if self.pass_config.xpu_inplace_all_reduce:
+                self.passes += [XpuAllReduceInplacePass(config)]
 
             self.ir_lowering = VllmIRLoweringPass(config)
             self.clone_elimination = UnsafeCloneEliminationPass(config)
